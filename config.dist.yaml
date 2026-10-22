@@ -29,4 +29,4 @@ udp-buf-size: 0
 upstream:
   - "1.1.1.1:53"
 upstream-mode: "load_balance"
-upstream-rtt-decay: '10s'
+upstream-rtt-decay: '10m'

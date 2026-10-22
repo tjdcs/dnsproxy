@@ -69,7 +69,7 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 
 		// reqInterval is the time between requests.  requestsNum requests
 		// span many [DefaultUpstreamRTTDecay] periods.
-		reqInterval = 100 * time.Millisecond
+		reqInterval = DefaultUpstreamRTTDecay / 100
 	)
 
 	// clock returns the value of currentNow and advances it by a microsecond.
@@ -172,9 +172,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{err2Ups, err1Ups},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():    3488,
-			slowerUps.Address():  366,
-			fastestUps.Address(): 6147,
+			fastUps.Address():    3542,
+			slowerUps.Address():  379,
+			fastestUps.Address(): 6080,
 		},
 		name:    "error_once",
 		servers: []upstream.Upstream{fastUps, slowerUps, fastestUps},
