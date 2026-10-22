@@ -152,6 +152,8 @@ Usage of ./dnsproxy:
         An upstream to be used (can be specified multiple times). You can also specify path to a file with the list of servers.
   --upstream-mode=mode
         Defines the upstreams logic mode, possible values: load_balance, parallel, fastest_addr (default: load_balance).
+  --upstream-rtt-decay=duration
+        Time constant of the upstreams' round-trip time moving average used by the load_balance upstream mode, in a human-readable form. Default: 10s.
   --use-private-rdns
         If specified, use private upstreams for reverse DNS lookups of private addresses.
   --verbose/-v

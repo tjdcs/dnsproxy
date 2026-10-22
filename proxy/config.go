@@ -28,6 +28,9 @@ const (
 	// DefaultOptimisticAnswerTTL is default value for
 	// [Config.CacheOptimisticAnswerTTL].
 	DefaultOptimisticAnswerTTL = 30 * time.Second
+
+	// DefaultUpstreamRTTDecay is default value for [Config.UpstreamRTTDecay].
+	DefaultUpstreamRTTDecay = 10 * time.Second
 )
 
 // Config contains all the fields necessary for proxy configuration.
@@ -176,6 +179,19 @@ type Config struct {
 	// Non-positive value will be replaced with the default one.
 	FastestPingTimeout time.Duration
 
+	// UpstreamRTTDecay is the time constant of the exponentially weighted
+	// moving average of upstreams' round-trip times, used to weight upstreams
+	// in [UpstreamModeLoadBalance].  A sample's weight decays by a factor of e
+	// per UpstreamRTTDecay.  It must not be negative.  Default value is
+	// [DefaultUpstreamRTTDecay].
+	UpstreamRTTDecay time.Duration
+
+	// UpstreamTimeout is the timeout configured for upstreams.  It's recorded
+	// as the round-trip time of a failed exchange in
+	// [UpstreamModeLoadBalance].  It must not be negative.  Default value is
+	// 10 seconds.
+	UpstreamTimeout time.Duration
+
 	// RefuseAny makes proxy refuse the requests of type ANY.
 	RefuseAny bool
 
@@ -311,6 +327,14 @@ func (c *Config) Validate() (err error) {
 		// Go on.
 	default:
 		return fmt.Errorf("upstream mode: %w: %q", errors.ErrBadEnumValue, c.UpstreamMode)
+	}
+
+	err = errors.Join(
+		validate.NotNegative("UpstreamRTTDecay", c.UpstreamRTTDecay),
+		validate.NotNegative("UpstreamTimeout", c.UpstreamTimeout),
+	)
+	if err != nil {
+		return err
 	}
 
 	if c.HTTPConfig != nil && c.HTTPConfig.Userinfo != nil {

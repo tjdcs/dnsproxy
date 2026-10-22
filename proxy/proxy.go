@@ -301,6 +301,14 @@ type Proxy struct {
 	// when cache is optimistic.  Default value is [DefaultOptimisticMaxAge].
 	cacheOptimisticMaxAge time.Duration
 
+	// upstreamRTTDecay is the time constant of the upstreams' round-trip time
+	// moving average.  Default value is [DefaultUpstreamRTTDecay].
+	upstreamRTTDecay time.Duration
+
+	// upstreamTimeout is recorded as the round-trip time of a failed exchange.
+	// Default value is [defaultTimeout].
+	upstreamTimeout time.Duration
+
 	// fastestPingTimeout is the timeout for waiting the first successful
 	// dialing when the UpstreamMode is set to [UpstreamModeFastestAddr].
 	// Non-positive value will be replaced with the default one.
@@ -414,6 +422,8 @@ func New(c *Config) (p *Proxy, err error) {
 		maxGoroutines:             c.MaxGoroutines,
 		cacheOptimisticMaxAge:     c.CacheOptimisticMaxAge,
 		cacheOptimisticAnswerTTL:  c.CacheOptimisticAnswerTTL,
+		upstreamRTTDecay:          c.UpstreamRTTDecay,
+		upstreamTimeout:           c.UpstreamTimeout,
 		cacheMaxTTL:               c.CacheMaxTTL,
 		cacheMinTTL:               c.CacheMinTTL,
 		cacheSizeBytes:            c.CacheSizeBytes,
@@ -464,6 +474,8 @@ func New(c *Config) (p *Proxy, err error) {
 
 	p.cacheOptimisticAnswerTTL = cmp.Or(p.cacheOptimisticAnswerTTL, DefaultOptimisticAnswerTTL)
 	p.cacheOptimisticMaxAge = cmp.Or(p.cacheOptimisticMaxAge, DefaultOptimisticMaxAge)
+	p.upstreamRTTDecay = cmp.Or(p.upstreamRTTDecay, DefaultUpstreamRTTDecay)
+	p.upstreamTimeout = cmp.Or(p.upstreamTimeout, defaultTimeout)
 
 	p.initCache()
 

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -14,7 +15,6 @@ import (
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/golibs/testutil/faketime"
-	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 )
@@ -66,23 +66,18 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 	const (
 		testRTT     = 1 * time.Second
 		requestsNum = 10_000
+
+		// reqInterval is the time between requests.  requestsNum requests
+		// span many [DefaultUpstreamRTTDecay] periods.
+		reqInterval = 100 * time.Millisecond
 	)
 
-	// zeroingClock returns the value of currentNow and sets it back to
-	// zeroTime, so that all the calls since the second one return the same zero
-	// value until currentNow is modified elsewhere.
-	zeroTime := time.Unix(0, 0)
-	currentNow := zeroTime
-	zeroingClock := &faketime.Clock{
+	// clock returns the value of currentNow and advances it by a microsecond.
+	// Upstreams advance currentNow by their RTT.
+	currentNow := time.Unix(0, 0)
+	clock := &faketime.Clock{
 		OnNow: func() (now time.Time) {
-			now, currentNow = currentNow, zeroTime
-
-			return now
-		},
-	}
-	constClock := &faketime.Clock{
-		OnNow: func() (now time.Time) {
-			now, currentNow = currentNow, currentNow.Add(testRTT/50)
+			now, currentNow = currentNow, currentNow.Add(time.Microsecond)
 
 			return now
 		},
@@ -90,7 +85,7 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 
 	fastUps := &testUpstream{
 		OnExchange: func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
-			currentNow = zeroTime.Add(testRTT / 100)
+			currentNow = currentNow.Add(testRTT / 100)
 
 			return (&dns.Msg{}).SetReply(req), nil
 		},
@@ -99,7 +94,7 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 	}
 	slowerUps := &testUpstream{
 		OnExchange: func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
-			currentNow = zeroTime.Add(testRTT / 10)
+			currentNow = currentNow.Add(testRTT / 10)
 
 			return (&dns.Msg{}).SetReply(req), nil
 		},
@@ -108,7 +103,7 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 	}
 	slowestUps := &testUpstream{
 		OnExchange: func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
-			currentNow = zeroTime.Add(testRTT / 2)
+			currentNow = currentNow.Add(testRTT / 2)
 
 			return (&dns.Msg{}).SetReply(req), nil
 		},
@@ -136,7 +131,7 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 	fastestUps := &testUpstream{
 		OnExchange: func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
 			singleError.Do(func() { err = assert.AnError })
-			currentNow = zeroTime.Add(testRTT / 200)
+			currentNow = currentNow.Add(testRTT / 200)
 
 			return (&dns.Msg{}).SetReply(req), err
 		},
@@ -150,7 +145,6 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 
 	testCases := []struct {
 		wantStat map[string]int64
-		clock    timeutil.Clock
 		name     string
 		servers  []upstream.Upstream
 	}{{
@@ -159,7 +153,6 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 			slowerUps.Address():  902,
 			slowestUps.Address(): 188,
 		},
-		clock:   zeroingClock,
 		name:    "all_good",
 		servers: []upstream.Upstream{slowestUps, slowerUps, fastUps},
 	}, {
@@ -168,7 +161,6 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 			slowerUps.Address(): 890,
 			err1Ups.Address():   6,
 		},
-		clock:   zeroingClock,
 		name:    "one_bad",
 		servers: []upstream.Upstream{fastUps, err1Ups, slowerUps},
 	}, {
@@ -176,25 +168,22 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 			err1Ups.Address(): requestsNum,
 			err2Ups.Address(): requestsNum,
 		},
-		clock:   zeroingClock,
 		name:    "all_bad",
 		servers: []upstream.Upstream{err2Ups, err1Ups},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():    7222,
-			slowerUps.Address():  748,
-			fastestUps.Address(): 2031,
+			fastUps.Address():    3488,
+			slowerUps.Address():  366,
+			fastestUps.Address(): 6147,
 		},
-		clock:   zeroingClock,
 		name:    "error_once",
 		servers: []upstream.Upstream{fastUps, slowerUps, fastestUps},
 	}, {
 		wantStat: map[string]int64{
-			each200.Address(): 5258,
-			each100.Address(): 3142,
-			each50.Address():  1690,
+			each200.Address(): 5192,
+			each100.Address(): 3100,
+			each50.Address():  1800,
 		},
-		clock:   constClock,
 		name:    "error_each_nth",
 		servers: []upstream.Upstream{each200, each100, each50},
 	}}
@@ -221,7 +210,7 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 			},
 			TrustedProxies: dnsproxytest.DefaultTrustedProxies,
 		})
-		p.time = tc.clock
+		p.time = clock
 		p.randSrc = randSrc
 
 		wantStat := tc.wantStat
@@ -231,9 +220,119 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 				ctx := testutil.ContextWithTimeout(t, defaultTimeout)
 
 				_ = p.Resolve(ctx, &DNSContext{Req: req, Addr: cli})
+				currentNow = currentNow.Add(reqInterval)
 			}
 
 			assert.Equal(t, wantStat, stats)
 		})
 	}
+}
+
+func TestUpstreamRTTStats_update(t *testing.T) {
+	t.Parallel()
+
+	const (
+		tau     = 10 * time.Second
+		prevRTT = 100 * time.Millisecond
+		newRTT  = 10 * time.Millisecond
+	)
+
+	start := time.Unix(0, 0)
+	prev := upstreamRTTStats{}.update(prevRTT, start, tau)
+
+	testCases := []struct {
+		now      time.Time
+		name     string
+		wantEWMA float64
+	}{{
+		now:      start,
+		name:     "no_time_passed",
+		wantEWMA: float64(prevRTT.Microseconds()),
+	}, {
+		now:      start.Add(-time.Second),
+		name:     "clock_backwards",
+		wantEWMA: float64(prevRTT.Microseconds()),
+	}, {
+		now:  start.Add(tau),
+		name: "one_tau",
+		wantEWMA: float64(newRTT.Microseconds()) +
+			float64((prevRTT-newRTT).Microseconds())/math.E,
+	}, {
+		now:      start.Add(100 * tau),
+		name:     "long_ago",
+		wantEWMA: float64(newRTT.Microseconds()),
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := prev.update(newRTT, tc.now, tau)
+			assert.InDelta(t, tc.wantEWMA, got.ewma, 1e-6)
+			assert.Equal(t, tc.now, got.last)
+		})
+	}
+
+	t.Run("first_sample", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Equal(t, float64(prevRTT.Microseconds()), prev.ewma)
+		assert.Equal(t, start, prev.last)
+	})
+}
+
+func TestProxy_exchangeUpstreams_failurePenalty(t *testing.T) {
+	t.Parallel()
+
+	const upsTimeout = 3 * time.Second
+
+	okUps := &testUpstream{
+		OnExchange: func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
+			return (&dns.Msg{}).SetReply(req), nil
+		},
+		OnAddress: func() (addr string) { return "ok" },
+		OnClose:   func() (_ error) { panic(testutil.UnexpectedCall()) },
+	}
+	errUps := &testUpstream{
+		OnExchange: func(_ context.Context, _ *dns.Msg) (r *dns.Msg, err error) {
+			return nil, assert.AnError
+		},
+		OnAddress: func() (addr string) { return "error" },
+		OnClose:   func() (_ error) { panic(testutil.UnexpectedCall()) },
+	}
+
+	ups := []upstream.Upstream{okUps, errUps}
+	p := mustNew(t, &Config{
+		Logger:        testLogger,
+		UDPListenAddr: []*net.UDPAddr{dnsproxytest.LocalhostAnyPortUDP},
+		TCPListenAddr: []*net.TCPAddr{dnsproxytest.LocalhostAnyPortTCP},
+		UpstreamConfig: &UpstreamConfig{
+			Upstreams: ups,
+		},
+		TrustedProxies:  dnsproxytest.DefaultTrustedProxies,
+		UpstreamTimeout: upsTimeout,
+	})
+
+	// Without samples both upstreams have the same weight, so the erroring one
+	// is tried within a few requests.
+	req := dnsproxytest.NewTestRequest()
+	for range 100 {
+		ctx := testutil.ContextWithTimeout(t, defaultTimeout)
+		_, _, err := p.exchangeUpstreams(ctx, req, ups)
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		p.rttLock.Lock()
+		stat, ok := p.upstreamRTTStats[errUps.Address()]
+		p.rttLock.Unlock()
+
+		if ok {
+			assert.Equal(t, float64(upsTimeout.Microseconds()), stat.ewma)
+
+			return
+		}
+	}
+
+	t.Fatal("erroring upstream was never tried")
 }

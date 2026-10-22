@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
@@ -61,9 +62,7 @@ func (p *Proxy) exchangeUpstreams(
 
 		errs = append(errs, err)
 
-		// TODO(e.burkov):  Use the actual configured timeout or, perhaps, the
-		// actual measured elapsed time.
-		p.updateRTT(u.Address(), defaultTimeout)
+		p.updateRTT(u.Address(), p.upstreamTimeout)
 	}
 
 	err = fmt.Errorf("all upstreams failed to exchange request: %w", errors.Join(errs...))
@@ -110,21 +109,37 @@ func (p *Proxy) exchange(
 
 // upstreamRTTStats is the statistics for a single upstream's round-trip time.
 type upstreamRTTStats struct {
-	// rttSum is the sum of all the round-trip times in microseconds.  The
-	// float64 type is used since it's capable of representing about 285 years
-	// in microseconds.
-	rttSum float64
+	// last is the time of the latest update.  It's zero if there were no
+	// updates.
+	last time.Time
 
-	// reqNum is the number of requests to the upstream.  The float64 type is
-	// used since to avoid unnecessary type conversions.
-	reqNum float64
+	// ewma is the exponentially weighted moving average of the round-trip
+	// time in microseconds.
+	ewma float64
 }
 
-// update returns updated stats after adding given RTT.
-func (stats upstreamRTTStats) update(rtt time.Duration) (updated upstreamRTTStats) {
+// update returns updated stats after adding given RTT measured at now.  Older
+// samples' weight decays by a factor of e per tau.  tau must be positive.
+func (stats upstreamRTTStats) update(
+	rtt time.Duration,
+	now time.Time,
+	tau time.Duration,
+) (updated upstreamRTTStats) {
+	sample := float64(rtt.Microseconds())
+	if stats.last.IsZero() {
+		return upstreamRTTStats{
+			last: now,
+			ewma: sample,
+		}
+	}
+
+	// Clamp to keep the weight within [0, 1] if the clock goes backwards.
+	elapsed := max(now.Sub(stats.last), 0)
+	w := math.Exp(-elapsed.Seconds() / tau.Seconds())
+
 	return upstreamRTTStats{
-		rttSum: stats.rttSum + float64(rtt.Microseconds()),
-		reqNum: stats.reqNum + 1,
+		last: now,
+		ewma: w*stats.ewma + (1-w)*sample,
 	}
 }
 
@@ -138,11 +153,11 @@ func (p *Proxy) calcWeights(ups []upstream.Upstream) (weights []float64) {
 
 	for _, u := range ups {
 		stat := p.upstreamRTTStats[u.Address()]
-		if stat.rttSum == 0 || stat.reqNum == 0 {
+		if stat.ewma == 0 {
 			// Use 1 as the default weight.
 			weights = append(weights, 1)
 		} else {
-			weights = append(weights, 1/(stat.rttSum/stat.reqNum))
+			weights = append(weights, 1/stat.ewma)
 		}
 	}
 
@@ -152,6 +167,8 @@ func (p *Proxy) calcWeights(ups []upstream.Upstream) (weights []float64) {
 // updateRTT updates the round-trip time in [upstreamRTTStats] for given
 // address.
 func (p *Proxy) updateRTT(address string, rtt time.Duration) {
+	now := p.time.Now()
+
 	p.rttLock.Lock()
 	defer p.rttLock.Unlock()
 
@@ -159,5 +176,5 @@ func (p *Proxy) updateRTT(address string, rtt time.Duration) {
 		p.upstreamRTTStats = map[string]upstreamRTTStats{}
 	}
 
-	p.upstreamRTTStats[address] = p.upstreamRTTStats[address].update(rtt)
+	p.upstreamRTTStats[address] = p.upstreamRTTStats[address].update(rtt, now, p.upstreamRTTDecay)
 }
