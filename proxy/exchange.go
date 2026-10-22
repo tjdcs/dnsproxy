@@ -55,14 +55,14 @@ func (p *Proxy) exchangeUpstreams(
 		var elapsed time.Duration
 		resp, elapsed, err = p.exchange(ctx, u, req)
 		if err == nil {
-			p.updateRTT(u.Address(), elapsed)
+			p.updateRTT(ctx, u.Address(), elapsed)
 
 			return resp, u, nil
 		}
 
 		errs = append(errs, err)
 
-		p.updateRTT(u.Address(), p.upstreamTimeout)
+		p.updateRTT(ctx, u.Address(), p.upstreamTimeout)
 	}
 
 	err = fmt.Errorf("all upstreams failed to exchange request: %w", errors.Join(errs...))
@@ -166,15 +166,30 @@ func (p *Proxy) calcWeights(ups []upstream.Upstream) (weights []float64) {
 
 // updateRTT updates the round-trip time in [upstreamRTTStats] for given
 // address.
-func (p *Proxy) updateRTT(address string, rtt time.Duration) {
+func (p *Proxy) updateRTT(ctx context.Context, address string, rtt time.Duration) {
 	now := p.time.Now()
 
 	p.rttLock.Lock()
-	defer p.rttLock.Unlock()
-
 	if p.upstreamRTTStats == nil {
 		p.upstreamRTTStats = map[string]upstreamRTTStats{}
 	}
 
-	p.upstreamRTTStats[address] = p.upstreamRTTStats[address].update(rtt, now, p.upstreamRTTDecay)
+	prev := p.upstreamRTTStats[address]
+	updated := prev.update(rtt, now, p.upstreamRTTDecay)
+	p.upstreamRTTStats[address] = updated
+	p.rttLock.Unlock()
+
+	p.logger.DebugContext(
+		ctx,
+		"updated upstream rtt",
+		"upstream", address,
+		"rtt", rtt,
+		"prev", ewmaDuration(prev.ewma),
+		"ewma", ewmaDuration(updated.ewma),
+	)
+}
+
+// ewmaDuration converts an RTT moving average in microseconds to a duration.
+func ewmaDuration(us float64) (d time.Duration) {
+	return time.Duration(math.Round(us)) * time.Microsecond
 }
