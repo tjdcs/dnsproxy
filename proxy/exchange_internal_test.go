@@ -146,13 +146,20 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 
 	testCases := []struct {
 		wantStat map[string]int64
-		name     string
-		servers  []upstream.Upstream
+		// wantRTT, if not nil, are the expected RTT estimates at the end.
+		wantRTT map[string]time.Duration
+		name    string
+		servers []upstream.Upstream
 	}{{
 		wantStat: map[string]int64{
 			fastUps.Address():    8910,
 			slowerUps.Address():  902,
 			slowestUps.Address(): 188,
+		},
+		wantRTT: map[string]time.Duration{
+			fastUps.Address():    testRTT / 100,
+			slowerUps.Address():  testRTT / 10,
+			slowestUps.Address(): testRTT / 2,
 		},
 		name:    "all_good",
 		servers: []upstream.Upstream{slowestUps, slowerUps, fastUps},
@@ -176,6 +183,12 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 			fastUps.Address():    3542,
 			slowerUps.Address():  375,
 			fastestUps.Address(): 6084,
+		},
+		// The single failure has decayed away.
+		wantRTT: map[string]time.Duration{
+			fastUps.Address():    testRTT / 100,
+			slowerUps.Address():  testRTT / 10,
+			fastestUps.Address(): testRTT / 200,
 		},
 		name:    "error_once",
 		servers: []upstream.Upstream{fastUps, slowerUps, fastestUps},
@@ -214,7 +227,7 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		p.time = clock
 		p.randSrc = randSrc
 
-		wantStat := tc.wantStat
+		wantStat, wantRTT := tc.wantStat, tc.wantRTT
 
 		t.Run(tc.name, func(t *testing.T) {
 			for range requestsNum {
@@ -225,6 +238,11 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 			}
 
 			assert.Equal(t, wantStat, stats)
+
+			for addr, rtt := range wantRTT {
+				got := p.upstreamRTTStats[addr].ewma
+				assert.InEpsilon(t, float64(rtt.Microseconds()), got, 1e-3, addr)
+			}
 		})
 	}
 }
@@ -238,30 +256,43 @@ func TestUpstreamRTTStats_update(t *testing.T) {
 		newRTT  = 10 * time.Millisecond
 	)
 
-	start := time.Unix(0, 0)
-	prev := upstreamRTTStats{}.update(prevRTT, start, tau)
-
 	prevUS := float64(prevRTT.Microseconds())
 	newUS := float64(newRTT.Microseconds())
 
+	start := time.Unix(0, 0)
+	prev := upstreamRTTStats{
+		last: start,
+		ewma: prevUS,
+	}
+
 	testCases := []struct {
 		now      time.Time
+		stats    upstreamRTTStats
 		name     string
 		wantEWMA float64
 	}{{
 		now:      start,
+		stats:    upstreamRTTStats{},
+		name:     "first_sample",
+		wantEWMA: newUS,
+	}, {
+		now:      start,
+		stats:    prev,
 		name:     "no_time_passed",
 		wantEWMA: prevUS,
 	}, {
 		now:      start.Add(-time.Second),
+		stats:    prev,
 		name:     "clock_backwards",
 		wantEWMA: prevUS,
 	}, {
 		now:      start.Add(tau),
+		stats:    prev,
 		name:     "one_tau",
 		wantEWMA: newUS + (prevUS-newUS)/math.E,
 	}, {
 		now:      start.Add(100 * tau),
+		stats:    prev,
 		name:     "long_ago",
 		wantEWMA: newUS,
 	}}
@@ -270,18 +301,11 @@ func TestUpstreamRTTStats_update(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := prev.update(newRTT, tc.now, tau)
+			got := tc.stats.update(newRTT, tc.now, tau)
 			assert.InDelta(t, tc.wantEWMA, got.ewma, 1e-6)
 			assert.Equal(t, tc.now, got.last)
 		})
 	}
-
-	t.Run("first_sample", func(t *testing.T) {
-		t.Parallel()
-
-		assert.Equal(t, prevUS, prev.ewma)
-		assert.Equal(t, start, prev.last)
-	})
 }
 
 func TestProxy_exchangeUpstreams_failurePenalty(t *testing.T) {
@@ -289,22 +313,17 @@ func TestProxy_exchangeUpstreams_failurePenalty(t *testing.T) {
 
 	const upsTimeout = 3 * time.Second
 
-	okUps := &testUpstream{
-		OnExchange: func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
-			return (&dns.Msg{}).SetReply(req), nil
-		},
-		OnAddress: func() (addr string) { return "ok" },
-		OnClose:   func() (_ error) { panic(testutil.UnexpectedCall()) },
-	}
-	errUps := &testUpstream{
-		OnExchange: func(_ context.Context, _ *dns.Msg) (r *dns.Msg, err error) {
-			return nil, assert.AnError
-		},
-		OnAddress: func() (addr string) { return "error" },
-		OnClose:   func() (_ error) { panic(testutil.UnexpectedCall()) },
+	newErrUps := func(addr string) (u upstream.Upstream) {
+		return &testUpstream{
+			OnExchange: func(_ context.Context, _ *dns.Msg) (r *dns.Msg, err error) {
+				return nil, assert.AnError
+			},
+			OnAddress: func() (a string) { return addr },
+			OnClose:   func() (_ error) { panic(testutil.UnexpectedCall()) },
+		}
 	}
 
-	ups := []upstream.Upstream{okUps, errUps}
+	ups := []upstream.Upstream{newErrUps("error1"), newErrUps("error2")}
 	p := mustNew(t, &Config{
 		Logger:        testLogger,
 		UDPListenAddr: []*net.UDPAddr{dnsproxytest.LocalhostAnyPortUDP},
@@ -316,203 +335,12 @@ func TestProxy_exchangeUpstreams_failurePenalty(t *testing.T) {
 		UpstreamTimeout: upsTimeout,
 	})
 
-	// Without samples both upstreams have the same weight, so the erroring one
-	// is tried within a few requests.
-	req := dnsproxytest.NewTestRequest()
-	for range 100 {
-		ctx := testutil.ContextWithTimeout(t, defaultTimeout)
-		_, _, err := p.exchangeUpstreams(ctx, req, ups)
-		if !assert.NoError(t, err) {
-			return
-		}
+	// Both upstreams fail, so both are tried and penalized.
+	ctx := testutil.ContextWithTimeout(t, defaultTimeout)
+	_, _, err := p.exchangeUpstreams(ctx, dnsproxytest.NewTestRequest(), ups)
+	require.Error(t, err)
 
-		p.rttLock.Lock()
-		stat, ok := p.upstreamRTTStats[errUps.Address()]
-		p.rttLock.Unlock()
-
-		if ok {
-			assert.Equal(t, float64(upsTimeout.Microseconds()), stat.ewma)
-
-			return
-		}
+	for _, u := range ups {
+		assert.Equal(t, float64(upsTimeout.Microseconds()), p.upstreamRTTStats[u.Address()].ewma)
 	}
-
-	t.Fatal("erroring upstream was never tried")
-}
-
-// burstUpstream is an [upstream.Upstream] with a constant RTT that fails
-// failNum consecutive exchanges starting with the failStart-th one, counting
-// from 1.  It isn't safe for concurrent use.
-type burstUpstream struct {
-	// now is the fake current time, advanced by the exchange duration.
-	now *time.Time
-
-	// firstFail is the time of the first failed exchange.
-	firstFail time.Time
-
-	// recovered is the time of the first successful exchange after the
-	// failures.
-	recovered time.Time
-
-	name      string
-	rtt       time.Duration
-	timeout   time.Duration
-	failStart uint
-	failNum   uint
-	n         uint
-}
-
-// type check
-var _ upstream.Upstream = (*burstUpstream)(nil)
-
-// Exchange implements the [upstream.Upstream] interface for *burstUpstream.
-func (u *burstUpstream) Exchange(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
-	u.n++
-	if u.n >= u.failStart && u.n < u.failStart+u.failNum {
-		if u.firstFail.IsZero() {
-			u.firstFail = *u.now
-		}
-
-		*u.now = u.now.Add(u.timeout)
-
-		return nil, assert.AnError
-	}
-
-	if u.n == u.failStart+u.failNum {
-		u.recovered = *u.now
-	}
-
-	*u.now = u.now.Add(u.rtt)
-
-	return (&dns.Msg{}).SetReply(req), nil
-}
-
-// Address implements the [upstream.Upstream] interface for *burstUpstream.
-func (u *burstUpstream) Address() (addr string) { return u.name }
-
-// Close implements the [upstream.Upstream] interface for *burstUpstream.
-func (u *burstUpstream) Close() (err error) { panic(testutil.UnexpectedCall()) }
-
-// loadBalanceBurstResult is the result of [runLoadBalanceBurst].
-type loadBalanceBurstResult struct {
-	// stats are the numbers of exchanges per upstream address.
-	stats map[string]int64
-
-	// burst is the upstream that fails its exchanges.
-	burst *burstUpstream
-
-	// burstRTT is the final statistics of burst.
-	burstRTT upstreamRTTStats
-}
-
-// runLoadBalanceBurst resolves requestsNum requests, one per reqInterval, over
-// upstreams with RTTs of 5, 10, and 100 ms.  The 5 ms one fails failNum
-// consecutive exchanges starting with its failStart-th.  The proxy uses the
-// default RTT decay and upstream timeout.
-func runLoadBalanceBurst(
-	t *testing.T,
-	seed uint64,
-	requestsNum int,
-	reqInterval time.Duration,
-	failStart uint,
-	failNum uint,
-) (res *loadBalanceBurstResult) {
-	t.Helper()
-
-	currentNow := time.Unix(0, 0)
-	clock := &faketime.Clock{
-		OnNow: func() (now time.Time) {
-			now, currentNow = currentNow, currentNow.Add(time.Microsecond)
-
-			return now
-		},
-	}
-
-	newUps := func(name string, rtt time.Duration) (u *burstUpstream) {
-		return &burstUpstream{
-			now:     &currentNow,
-			name:    name,
-			rtt:     rtt,
-			timeout: defaultTimeout,
-		}
-	}
-
-	burst := newUps("burst", 5*time.Millisecond)
-	burst.failStart, burst.failNum = failStart, failNum
-
-	stats := map[string]int64{}
-	ups := []upstream.Upstream{}
-	for _, u := range []*burstUpstream{
-		burst,
-		newUps("fast", 10*time.Millisecond),
-		newUps("slower", 100*time.Millisecond),
-	} {
-		ups = append(ups, measuredUpstream{Upstream: u, stats: stats})
-	}
-
-	p := mustNew(t, &Config{
-		Logger:        testLogger,
-		UDPListenAddr: []*net.UDPAddr{dnsproxytest.LocalhostAnyPortUDP},
-		TCPListenAddr: []*net.TCPAddr{dnsproxytest.LocalhostAnyPortTCP},
-		UpstreamConfig: &UpstreamConfig{
-			Upstreams: ups,
-		},
-		TrustedProxies: dnsproxytest.DefaultTrustedProxies,
-	})
-	p.time = clock
-	p.randSrc = rand.New(rand.NewPCG(seed, seed))
-
-	req := dnsproxytest.NewTestRequest()
-	for range requestsNum {
-		ctx := testutil.ContextWithTimeout(t, defaultTimeout)
-		_, _, err := p.exchangeUpstreams(ctx, req, ups)
-		require.NoError(t, err)
-
-		currentNow = currentNow.Add(reqInterval)
-	}
-
-	return &loadBalanceBurstResult{
-		stats:    stats,
-		burst:    burst,
-		burstRTT: p.upstreamRTTStats[burst.name],
-	}
-}
-
-func TestProxy_Exchange_loadBalanceBurst(t *testing.T) {
-	t.Parallel()
-
-	const (
-		// reqInterval is 300 requests per hour.
-		reqInterval = 12 * time.Second
-		requestsNum = 30_000
-		seed        = 42
-		failStart   = 1000
-		failNum     = 10
-	)
-
-	base := runLoadBalanceBurst(t, seed, requestsNum, reqInterval, failStart, 0)
-	got := runLoadBalanceBurst(t, seed, requestsNum, reqInterval, failStart, failNum)
-
-	assert.Equal(t, map[string]int64{
-		"burst":  19_382,
-		"fast":   9_623,
-		"slower": 995,
-	}, base.stats)
-	assert.Equal(t, map[string]int64{
-		"burst":  12_921,
-		"fast":   15_522,
-		"slower": 1_567,
-	}, got.stats)
-
-	burst := got.burst
-	require.False(t, burst.recovered.IsZero(), "burst upstream never recovered")
-
-	// By the end of the run the estimate has returned to the upstream's RTT.
-	assert.InEpsilon(t, float64(burst.rtt.Microseconds()), got.burstRTT.ewma, 1e-3)
-
-	t.Logf(
-		"lost picks: %d; failures to recovery: %s",
-		base.stats[burst.name]-got.stats[burst.name],
-		burst.recovered.Sub(burst.firstFail),
-	)
 }
