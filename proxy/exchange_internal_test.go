@@ -166,11 +166,11 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{slowestUps, slowerUps, fastUps},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():   9910,
-			slowerUps.Address(): 90,
+			fastUps.Address():   9911,
+			slowerUps.Address(): 89,
 			// Never answered, so no baseline: its weight is pulled
-			// towards 1/3 between failures, and it's retried.
-			err1Ups.Address(): 432,
+			// towards 1/3 between failures, slower after each one.
+			err1Ups.Address(): 38,
 		},
 		name:    "one_bad",
 		servers: []upstream.Upstream{fastUps, err1Ups, slowerUps},
@@ -183,9 +183,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{err2Ups, err1Ups},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():    2567,
-			slowerUps.Address():  19,
-			fastestUps.Address(): 7415,
+			fastUps.Address():    2575,
+			slowerUps.Address():  26,
+			fastestUps.Address(): 7400,
 		},
 		// The single failure has decayed away.
 		wantRTT: map[string]time.Duration{
@@ -198,8 +198,8 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 	}, {
 		wantStat: map[string]int64{
 			each200.Address(): 5200,
-			each100.Address(): 3041,
-			each50.Address():  1852,
+			each100.Address(): 3123,
+			each50.Address():  1769,
 		},
 		name:    "error_each_nth",
 		servers: []upstream.Upstream{each200, each100, each50},
@@ -566,8 +566,62 @@ func TestProxy_updateRTT_baseline(t *testing.T) {
 	assert.Zero(t, stat.base)
 	assert.Zero(t, stat.baseNum)
 
+	assert.Equal(t, uint(1), stat.fails)
+
+	p.updateRTT(ctx, addr, p.upstreamTimeout, false)
+	assert.Equal(t, uint(2), p.upstreamRTTStats[addr].fails)
+
 	p.updateRTT(ctx, addr, rtt, true)
 	stat = p.upstreamRTTStats[addr]
 	assert.Equal(t, float64(rtt.Microseconds()), stat.base)
 	assert.Equal(t, 1.0, stat.baseNum)
+	assert.Zero(t, stat.fails)
+}
+
+func TestUpstreamRTTStats_pullDecay(t *testing.T) {
+	t.Parallel()
+
+	const tau = 5 * time.Minute
+
+	testCases := []struct {
+		name  string
+		fails uint
+		want  time.Duration
+	}{{
+		name:  "healthy",
+		fails: 0,
+		want:  tau,
+	}, {
+		name:  "one_failure",
+		fails: 1,
+		want:  tau,
+	}, {
+		name:  "two_failures",
+		fails: 2,
+		want:  2 * tau,
+	}, {
+		name:  "four_failures",
+		fails: 4,
+		want:  8 * tau,
+	}, {
+		name:  "capped",
+		fails: 1_000,
+		want:  upstreamRTTMaxPullDecay,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			stats := upstreamRTTStats{fails: tc.fails}
+			assert.Equal(t, tc.want, stats.pullDecay(tau))
+		})
+	}
+
+	t.Run("tau_above_cap", func(t *testing.T) {
+		t.Parallel()
+
+		stats := upstreamRTTStats{fails: 3}
+		assert.Equal(t, 2*upstreamRTTMaxPullDecay, stats.pullDecay(2*upstreamRTTMaxPullDecay))
+	})
 }
