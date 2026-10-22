@@ -30,7 +30,7 @@ const (
 	DefaultOptimisticAnswerTTL = 30 * time.Second
 
 	// DefaultUpstreamRTTDecay is default value for [Config.UpstreamRTTDecay].
-	DefaultUpstreamRTTDecay = 10 * time.Minute
+	DefaultUpstreamRTTDecay = 5 * time.Minute
 )
 
 // Config contains all the fields necessary for proxy configuration.
