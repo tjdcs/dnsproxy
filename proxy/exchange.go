@@ -3,7 +3,9 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
@@ -11,6 +13,21 @@ import (
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/miekg/dns"
 	"gonum.org/v1/gonum/stat/sampleuv"
+)
+
+const (
+	// upstreamRTTExponent is the exponent of the upstreams' round-trip time
+	// estimates in their weights in [UpstreamModeLoadBalance]: an upstream's
+	// weight is its estimate to the power of -upstreamRTTExponent, so an
+	// upstream twice as slow gets a quarter of the share.
+	upstreamRTTExponent = 2
+
+	// upstreamRTTBaselineDecay is the time constant of the upstreams'
+	// long-term round-trip time moving average of successful exchanges.  The
+	// estimate of an upstream that hasn't been used for a while is pulled
+	// towards it, so that a past failure's penalty fades even if the upstream
+	// is rarely chosen.
+	upstreamRTTBaselineDecay = 24 * time.Hour
 )
 
 // exchangeUpstreams resolves req using the given upstreams.  It returns the DNS
@@ -47,7 +64,7 @@ func (p *Proxy) exchangeUpstreams(
 		return resp, u, err
 	}
 
-	w := sampleuv.NewWeighted(p.calcWeights(ups), p.randSrc)
+	w := sampleuv.NewWeighted(p.calcWeights(ctx, ups), p.randSrc)
 	var errs []error
 	for i, ok := w.Take(); ok; i, ok = w.Take() {
 		u = ups[i]
@@ -55,14 +72,14 @@ func (p *Proxy) exchangeUpstreams(
 		var elapsed time.Duration
 		resp, elapsed, err = p.exchange(ctx, u, req)
 		if err == nil {
-			p.updateRTT(ctx, u.Address(), elapsed)
+			p.updateRTT(ctx, u.Address(), elapsed, true)
 
 			return resp, u, nil
 		}
 
 		errs = append(errs, err)
 
-		p.updateRTT(ctx, u.Address(), p.upstreamTimeout)
+		p.updateRTT(ctx, u.Address(), p.upstreamTimeout, false)
 	}
 
 	err = fmt.Errorf("all upstreams failed to exchange request: %w", errors.Join(errs...))
@@ -116,6 +133,18 @@ type upstreamRTTStats struct {
 	// ewma is the exponentially weighted moving average of the round-trip
 	// time in microseconds.
 	ewma float64
+
+	// baseLast is the time of the latest update of base.  It's zero if there
+	// were no updates.
+	baseLast time.Time
+
+	// base is the long-term moving average of the round-trip time of
+	// successful exchanges in microseconds.  It's zero if there were no
+	// updates.
+	base float64
+
+	// baseNum is the number of samples in base.
+	baseNum float64
 }
 
 // update returns updated stats after adding given RTT measured at now.  Older
@@ -125,48 +154,143 @@ func (stats upstreamRTTStats) update(
 	now time.Time,
 	tau time.Duration,
 ) (updated upstreamRTTStats) {
+	updated = stats
+	updated.last = now
+
 	sample := float64(rtt.Microseconds())
 	if stats.last.IsZero() {
-		return upstreamRTTStats{
-			last: now,
-			ewma: sample,
-		}
+		updated.ewma = sample
+
+		return updated
 	}
 
 	// Clamp to keep the weight within [0, 1] if the clock goes backwards.
 	elapsed := max(now.Sub(stats.last), 0)
 	w := math.Exp(-elapsed.Seconds() / tau.Seconds())
+	updated.ewma = w*stats.ewma + (1-w)*sample
 
-	return upstreamRTTStats{
-		last: now,
-		ewma: w*stats.ewma + (1-w)*sample,
+	return updated
+}
+
+// updateBase returns updated stats after adding given RTT of a successful
+// exchange measured at now to the baseline.  A sample's weight is the larger of
+// 1/n, for the n-th sample, and its time-decay weight, so that the baseline is
+// the plain average until it holds about tau's worth of samples.  Otherwise the
+// first sample would dominate it for a long time.  tau must be positive.
+func (stats upstreamRTTStats) updateBase(
+	rtt time.Duration,
+	now time.Time,
+	tau time.Duration,
+) (updated upstreamRTTStats) {
+	updated = stats
+	updated.baseLast = now
+	updated.baseNum++
+
+	w := 1 / updated.baseNum
+	if !stats.baseLast.IsZero() {
+		elapsed := max(now.Sub(stats.baseLast), 0)
+		w = max(w, -math.Expm1(-elapsed.Seconds()/tau.Seconds()))
 	}
+
+	updated.base = stats.base + w*(float64(rtt.Microseconds())-stats.base)
+
+	return updated
+}
+
+// estimate returns the round-trip time estimate in microseconds at now.  The
+// moving average is pulled towards the baseline, if any, as it gets older, by
+// a factor of e per tau.  tau must be positive.
+func (stats upstreamRTTStats) estimate(now time.Time, tau time.Duration) (est float64) {
+	if stats.baseNum == 0 {
+		return stats.ewma
+	}
+
+	age := max(now.Sub(stats.last), 0)
+	w := math.Exp(-age.Seconds() / tau.Seconds())
+
+	return w*stats.ewma + (1-w)*stats.base
 }
 
 // calcWeights returns the slice of weights, each corresponding to the upstream
-// with the same index in the given slice.  ups elements must not be nil.
-func (p *Proxy) calcWeights(ups []upstream.Upstream) (weights []float64) {
+// with the same index in the given slice, normalized to sum to 1 before the
+// pull described below.  ups elements must not be nil.
+//
+// An upstream that has been measured but has no baseline, since it never
+// answered successfully, has its weight pulled towards 1/len(ups) by a factor
+// of e per upstreamRTTDecay since its latest update.  Otherwise a failure on
+// its first exchange would exclude it until restart.
+func (p *Proxy) calcWeights(ctx context.Context, ups []upstream.Upstream) (weights []float64) {
 	weights = make([]float64, 0, len(ups))
+	// pull is the weight of the current value for upstreams without a
+	// baseline, -1 for the rest.
+	pull := make([]float64, 0, len(ups))
+
+	now := p.time.Now()
 
 	p.rttLock.Lock()
-	defer p.rttLock.Unlock()
-
 	for _, u := range ups {
 		stat := p.upstreamRTTStats[u.Address()]
-		if stat.ewma == 0 {
+		switch {
+		case stat.ewma == 0:
 			// Use 1 as the default weight.
 			weights = append(weights, 1)
-		} else {
-			weights = append(weights, 1/stat.ewma)
+			pull = append(pull, -1)
+		case stat.baseNum == 0:
+			weights = append(weights, math.Pow(stat.ewma, -upstreamRTTExponent))
+			age := max(now.Sub(stat.last), 0)
+			pull = append(pull, math.Exp(-age.Seconds()/p.upstreamRTTDecay.Seconds()))
+		default:
+			est := stat.estimate(now, p.upstreamRTTDecay)
+			weights = append(weights, math.Pow(est, -upstreamRTTExponent))
+			pull = append(pull, -1)
 		}
+	}
+	p.rttLock.Unlock()
+
+	var sum float64
+	for _, w := range weights {
+		sum += w
+	}
+
+	uniform := 1 / float64(len(ups))
+	for i, w := range weights {
+		weights[i] = w / sum
+		if a := pull[i]; a >= 0 {
+			weights[i] = a*weights[i] + (1-a)*uniform
+		}
+	}
+
+	if p.logger.Enabled(ctx, slog.LevelDebug) {
+		p.logger.DebugContext(ctx, "load_balance weights", "weights", formatWeights(ups, weights))
 	}
 
 	return weights
 }
 
+// formatWeights returns the weights normalized to sum to 1, as space-separated
+// address=weight pairs.  ups elements must not be nil.
+func formatWeights(ups []upstream.Upstream, weights []float64) (s string) {
+	var sum float64
+	for _, w := range weights {
+		sum += w
+	}
+
+	b := &strings.Builder{}
+	for i, u := range ups {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+
+		_, _ = fmt.Fprintf(b, "%s=%.4f", u.Address(), weights[i]/sum)
+	}
+
+	return b.String()
+}
+
 // updateRTT updates the round-trip time in [upstreamRTTStats] for given
-// address.
-func (p *Proxy) updateRTT(ctx context.Context, address string, rtt time.Duration) {
+// address.  ok is false if the exchange failed; failures don't affect the
+// baseline.
+func (p *Proxy) updateRTT(ctx context.Context, address string, rtt time.Duration, ok bool) {
 	now := p.time.Now()
 
 	p.rttLock.Lock()
@@ -176,6 +300,9 @@ func (p *Proxy) updateRTT(ctx context.Context, address string, rtt time.Duration
 
 	prev := p.upstreamRTTStats[address]
 	updated := prev.update(rtt, now, p.upstreamRTTDecay)
+	if ok {
+		updated = updated.updateBase(rtt, now, upstreamRTTBaselineDecay)
+	}
 	p.upstreamRTTStats[address] = updated
 	p.rttLock.Unlock()
 
@@ -186,6 +313,7 @@ func (p *Proxy) updateRTT(ctx context.Context, address string, rtt time.Duration
 		"rtt", rtt,
 		"prev", ewmaDuration(prev.ewma),
 		"ewma", ewmaDuration(updated.ewma),
+		"base", ewmaDuration(updated.base),
 	)
 }
 

@@ -152,9 +152,10 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers []upstream.Upstream
 	}{{
 		wantStat: map[string]int64{
-			fastUps.Address():    8910,
-			slowerUps.Address():  902,
-			slowestUps.Address(): 188,
+			// Shares go as RTT^-2: 10x slower gets about 1/100.
+			fastUps.Address():    9891,
+			slowerUps.Address():  107,
+			slowestUps.Address(): 2,
 		},
 		wantRTT: map[string]time.Duration{
 			fastUps.Address():    testRTT / 100,
@@ -165,9 +166,11 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{slowestUps, slowerUps, fastUps},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():   9110,
-			slowerUps.Address(): 890,
-			err1Ups.Address():   6,
+			fastUps.Address():   9910,
+			slowerUps.Address(): 90,
+			// Never answered, so no baseline: its weight is pulled
+			// towards 1/3 between failures, and it's retried.
+			err1Ups.Address(): 432,
 		},
 		name:    "one_bad",
 		servers: []upstream.Upstream{fastUps, err1Ups, slowerUps},
@@ -180,9 +183,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{err2Ups, err1Ups},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():    3542,
-			slowerUps.Address():  375,
-			fastestUps.Address(): 6084,
+			fastUps.Address():    2567,
+			slowerUps.Address():  19,
+			fastestUps.Address(): 7415,
 		},
 		// The single failure has decayed away.
 		wantRTT: map[string]time.Duration{
@@ -194,9 +197,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{fastUps, slowerUps, fastestUps},
 	}, {
 		wantStat: map[string]int64{
-			each200.Address(): 5192,
-			each100.Address(): 3100,
-			each50.Address():  1800,
+			each200.Address(): 5200,
+			each100.Address(): 3041,
+			each50.Address():  1852,
 		},
 		name:    "error_each_nth",
 		servers: []upstream.Upstream{each200, each100, each50},
@@ -343,4 +346,228 @@ func TestProxy_exchangeUpstreams_failurePenalty(t *testing.T) {
 	for _, u := range ups {
 		assert.Equal(t, float64(upsTimeout.Microseconds()), p.upstreamRTTStats[u.Address()].ewma)
 	}
+}
+
+func TestUpstreamRTTStats_updateBase(t *testing.T) {
+	t.Parallel()
+
+	const (
+		tau     = 10 * time.Second
+		prevRTT = 100 * time.Millisecond
+		newRTT  = 10 * time.Millisecond
+	)
+
+	prevUS := float64(prevRTT.Microseconds())
+	newUS := float64(newRTT.Microseconds())
+
+	start := time.Unix(0, 0)
+	warmingUp := upstreamRTTStats{
+		baseLast: start,
+		base:     prevUS,
+		baseNum:  1,
+	}
+	warm := upstreamRTTStats{
+		baseLast: start,
+		base:     prevUS,
+		baseNum:  1e6,
+	}
+
+	testCases := []struct {
+		now      time.Time
+		stats    upstreamRTTStats
+		name     string
+		wantBase float64
+	}{{
+		now:      start,
+		stats:    upstreamRTTStats{},
+		name:     "first_sample",
+		wantBase: newUS,
+	}, {
+		now:      start,
+		stats:    warmingUp,
+		name:     "warm_up_averages",
+		wantBase: (prevUS + newUS) / 2,
+	}, {
+		now:      start.Add(tau),
+		stats:    warmingUp,
+		name:     "warm_up_decay_wins",
+		wantBase: newUS + (prevUS-newUS)/math.E,
+	}, {
+		now:      start,
+		stats:    warm,
+		name:     "warm_no_time_passed",
+		wantBase: prevUS + (newUS-prevUS)/(warm.baseNum+1),
+	}, {
+		now:      start.Add(tau),
+		stats:    warm,
+		name:     "warm_one_tau",
+		wantBase: newUS + (prevUS-newUS)/math.E,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tc.stats.updateBase(newRTT, tc.now, tau)
+			assert.InDelta(t, tc.wantBase, got.base, 1e-6)
+			assert.Equal(t, tc.now, got.baseLast)
+			assert.Equal(t, tc.stats.baseNum+1, got.baseNum)
+		})
+	}
+}
+
+func TestUpstreamRTTStats_estimate(t *testing.T) {
+	t.Parallel()
+
+	const (
+		tau  = 10 * time.Second
+		ewma = 5_000_000.0
+		base = 10_000.0
+	)
+
+	start := time.Unix(0, 0)
+	stats := upstreamRTTStats{
+		last:    start,
+		ewma:    ewma,
+		base:    base,
+		baseNum: 1,
+	}
+
+	testCases := []struct {
+		now   time.Time
+		stats upstreamRTTStats
+		name  string
+		want  float64
+	}{{
+		now:   start.Add(100 * tau),
+		stats: upstreamRTTStats{last: start, ewma: ewma},
+		name:  "no_baseline",
+		want:  ewma,
+	}, {
+		now:   start,
+		stats: stats,
+		name:  "fresh",
+		want:  ewma,
+	}, {
+		now:   start.Add(-time.Second),
+		stats: stats,
+		name:  "clock_backwards",
+		want:  ewma,
+	}, {
+		now:   start.Add(tau),
+		stats: stats,
+		name:  "one_tau",
+		want:  base + (ewma-base)/math.E,
+	}, {
+		now:   start.Add(100 * tau),
+		stats: stats,
+		name:  "stale",
+		want:  base,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.InDelta(t, tc.want, tc.stats.estimate(tc.now, tau), 1e-6)
+		})
+	}
+}
+
+func TestProxy_calcWeights(t *testing.T) {
+	t.Parallel()
+
+	newUps := func(addr string) (u upstream.Upstream) {
+		return &testUpstream{
+			OnAddress: func() (a string) { return addr },
+		}
+	}
+
+	ups := []upstream.Upstream{newUps("fast"), newUps("slow"), newUps("unmeasured")}
+
+	p := mustNew(t, &Config{
+		Logger:        testLogger,
+		UDPListenAddr: []*net.UDPAddr{dnsproxytest.LocalhostAnyPortUDP},
+		TCPListenAddr: []*net.TCPAddr{dnsproxytest.LocalhostAnyPortTCP},
+		UpstreamConfig: &UpstreamConfig{
+			Upstreams: ups,
+		},
+		TrustedProxies: dnsproxytest.DefaultTrustedProxies,
+	})
+	now := time.Unix(1_000_000, 0)
+	p.time = &faketime.Clock{
+		OnNow: func() (n time.Time) { return now },
+	}
+
+	ctx := testutil.ContextWithTimeout(t, defaultTimeout)
+
+	t.Run("exponent", func(t *testing.T) {
+		p.upstreamRTTStats["fast"] = upstreamRTTStats{last: now, ewma: 1_000, base: 1_000, baseNum: 1}
+		p.upstreamRTTStats["slow"] = upstreamRTTStats{last: now, ewma: 2_000, base: 2_000, baseNum: 1}
+
+		w := p.calcWeights(ctx, ups)
+		require.Len(t, w, len(ups))
+
+		// Twice as slow gets a quarter of the weight, and an unmeasured
+		// upstream is tried first.
+		assert.InDelta(t, 4, w[0]/w[1], 1e-9)
+		assert.Greater(t, w[2], 0.99)
+	})
+
+	// failed is an upstream whose only exchange failed, so it has no
+	// baseline.
+	failed := upstreamRTTStats{ewma: float64(defaultTimeout.Microseconds())}
+	measured := []upstream.Upstream{ups[0], ups[1]}
+	p.upstreamRTTStats["fast"] = upstreamRTTStats{last: now, ewma: 1_000, base: 1_000, baseNum: 1}
+
+	t.Run("no_baseline_fresh", func(t *testing.T) {
+		failed.last = now
+		p.upstreamRTTStats["slow"] = failed
+
+		w := p.calcWeights(ctx, measured)
+		assert.Less(t, w[1], 1e-6)
+	})
+
+	t.Run("no_baseline_stale", func(t *testing.T) {
+		failed.last = now.Add(-100 * p.upstreamRTTDecay)
+		p.upstreamRTTStats["slow"] = failed
+
+		w := p.calcWeights(ctx, measured)
+		assert.InDelta(t, 0.5, w[1], 1e-6)
+	})
+}
+
+func TestProxy_updateRTT_baseline(t *testing.T) {
+	t.Parallel()
+
+	const (
+		addr = "upstream"
+		rtt  = 10 * time.Millisecond
+	)
+
+	p := mustNew(t, &Config{
+		Logger:        testLogger,
+		UDPListenAddr: []*net.UDPAddr{dnsproxytest.LocalhostAnyPortUDP},
+		TCPListenAddr: []*net.TCPAddr{dnsproxytest.LocalhostAnyPortTCP},
+		UpstreamConfig: &UpstreamConfig{
+			Upstreams: []upstream.Upstream{&testUpstream{
+				OnAddress: func() (a string) { return addr },
+			}},
+		},
+		TrustedProxies: dnsproxytest.DefaultTrustedProxies,
+	})
+
+	ctx := testutil.ContextWithTimeout(t, defaultTimeout)
+
+	// A failure updates the moving average but not the baseline.
+	p.updateRTT(ctx, addr, p.upstreamTimeout, false)
+	stat := p.upstreamRTTStats[addr]
+	assert.Equal(t, float64(p.upstreamTimeout.Microseconds()), stat.ewma)
+	assert.Zero(t, stat.base)
+	assert.Zero(t, stat.baseNum)
+
+	p.updateRTT(ctx, addr, rtt, true)
+	stat = p.upstreamRTTStats[addr]
+	assert.Equal(t, float64(rtt.Microseconds()), stat.base)
+	assert.Equal(t, 1.0, stat.baseNum)
 }
