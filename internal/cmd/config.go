@@ -104,7 +104,7 @@ type configuration struct {
 	Timeout timeutil.Duration `yaml:"timeout"`
 
 	// UpstreamRTTDecay is the time constant of the upstreams' round-trip time
-	// moving average used by the load_balance upstream mode.  Default is 5m.
+	// moving average used by the load_balance upstream mode.  Default is 2m.
 	UpstreamRTTDecay timeutil.Duration `yaml:"upstream-rtt-decay"`
 
 	// CacheMinTTL is the minimum TTL value for caching DNS entries, in seconds.

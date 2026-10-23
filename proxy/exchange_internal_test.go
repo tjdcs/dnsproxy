@@ -170,7 +170,7 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 			slowerUps.Address(): 16,
 			// Never answered, so no baseline: its weight is pulled
 			// towards 1/3 between failures, slower after each one.
-			err1Ups.Address(): 32,
+			err1Ups.Address(): 25,
 		},
 		name:    "one_bad",
 		servers: []upstream.Upstream{fastUps, err1Ups, slowerUps},
@@ -183,9 +183,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{err2Ups, err1Ups},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():    1764,
-			slowerUps.Address():  9,
-			fastestUps.Address(): 8228,
+			fastUps.Address():    1759,
+			slowerUps.Address():  10,
+			fastestUps.Address(): 8232,
 		},
 		// The single failure has decayed away.
 		wantRTT: map[string]time.Duration{
@@ -197,9 +197,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{fastUps, slowerUps, fastestUps},
 	}, {
 		wantStat: map[string]int64{
-			each200.Address(): 5521,
-			each100.Address(): 2915,
-			each50.Address():  1653,
+			each200.Address(): 5600,
+			each100.Address(): 2861,
+			each50.Address():  1627,
 		},
 		name:    "error_each_nth",
 		servers: []upstream.Upstream{each200, each100, each50},
