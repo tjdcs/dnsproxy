@@ -19,8 +19,8 @@ const (
 	// upstreamRTTExponent is the exponent of the upstreams' round-trip time
 	// estimates in their weights in [UpstreamModeLoadBalance]: an upstream's
 	// weight is its estimate to the power of -upstreamRTTExponent, so an
-	// upstream twice as slow gets a quarter of the share.
-	upstreamRTTExponent = 2
+	// upstream twice as slow gets an eighth of the share.
+	upstreamRTTExponent = 3
 
 	// upstreamRTTBaselineDecay is the time constant of the upstreams'
 	// long-term round-trip time moving average of successful exchanges.  The

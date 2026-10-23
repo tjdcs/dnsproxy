@@ -152,10 +152,10 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers []upstream.Upstream
 	}{{
 		wantStat: map[string]int64{
-			// Shares go as RTT^-2: 10x slower gets about 1/100.
-			fastUps.Address():    9891,
-			slowerUps.Address():  107,
-			slowestUps.Address(): 2,
+			// Shares go as RTT^-3: 10x slower gets about 1/1000.
+			fastUps.Address():    9991,
+			slowerUps.Address():  8,
+			slowestUps.Address(): 1,
 		},
 		wantRTT: map[string]time.Duration{
 			fastUps.Address():    testRTT / 100,
@@ -166,11 +166,11 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{slowestUps, slowerUps, fastUps},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():   9911,
-			slowerUps.Address(): 89,
+			fastUps.Address():   9988,
+			slowerUps.Address(): 12,
 			// Never answered, so no baseline: its weight is pulled
 			// towards 1/3 between failures, slower after each one.
-			err1Ups.Address(): 38,
+			err1Ups.Address(): 32,
 		},
 		name:    "one_bad",
 		servers: []upstream.Upstream{fastUps, err1Ups, slowerUps},
@@ -183,9 +183,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{err2Ups, err1Ups},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():    2575,
-			slowerUps.Address():  26,
-			fastestUps.Address(): 7400,
+			fastUps.Address():    1772,
+			slowerUps.Address():  5,
+			fastestUps.Address(): 8224,
 		},
 		// The single failure has decayed away.
 		wantRTT: map[string]time.Duration{
@@ -197,9 +197,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{fastUps, slowerUps, fastestUps},
 	}, {
 		wantStat: map[string]int64{
-			each200.Address(): 5200,
-			each100.Address(): 3123,
-			each50.Address():  1769,
+			each200.Address(): 5521,
+			each100.Address(): 2915,
+			each50.Address():  1653,
 		},
 		name:    "error_each_nth",
 		servers: []upstream.Upstream{each200, each100, each50},
@@ -508,9 +508,9 @@ func TestProxy_calcWeights(t *testing.T) {
 		w := p.calcWeights(ctx, ups)
 		require.Len(t, w, len(ups))
 
-		// Twice as slow gets a quarter of the weight, and an unmeasured
+		// Twice as slow gets an eighth of the weight, and an unmeasured
 		// upstream is tried first.
-		assert.InDelta(t, 4, w[0]/w[1], 1e-9)
+		assert.InDelta(t, 8, w[0]/w[1], 1e-9)
 		assert.Greater(t, w[2], 0.99)
 	})
 
