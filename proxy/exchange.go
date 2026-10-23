@@ -27,7 +27,7 @@ const (
 	// estimate of an upstream that hasn't been used for a while is pulled
 	// towards it, so that a past failure's penalty fades even if the upstream
 	// is rarely chosen.
-	upstreamRTTBaselineDecay = 24 * time.Hour
+	upstreamRTTBaselineDecay = 4 * time.Hour
 
 	// upstreamRTTBaselineMin is the number of successful exchanges before an
 	// upstream's baseline is used.  Until then its weight is pulled towards
