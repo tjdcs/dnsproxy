@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -152,10 +153,11 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers []upstream.Upstream
 	}{{
 		wantStat: map[string]int64{
-			// Shares go as RTT^-3: 10x slower gets about 1/1000.
-			fastUps.Address():    9983,
-			slowerUps.Address():  12,
-			slowestUps.Address(): 5,
+			// Each ring is filled first (16 answers), then shares go as
+			// RTT^-3: 10x slower gets about 1/1000.
+			fastUps.Address():    9967,
+			slowerUps.Address():  17,
+			slowestUps.Address(): 16,
 		},
 		wantRTT: map[string]time.Duration{
 			fastUps.Address():    testRTT / 100,
@@ -166,11 +168,12 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{slowestUps, slowerUps, fastUps},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():   9984,
-			slowerUps.Address(): 16,
-			// Never answered, so no baseline: its weight is pulled
-			// towards 1/3 between failures, slower after each one.
-			err1Ups.Address(): 25,
+			fastUps.Address():   9980,
+			slowerUps.Address(): 20,
+			// Never answered, so its ring stays empty: its weight is
+			// pulled towards 1/3 as each failure ages, slower after each
+			// one.
+			err1Ups.Address(): 21,
 		},
 		name:    "one_bad",
 		servers: []upstream.Upstream{fastUps, err1Ups, slowerUps},
@@ -183,9 +186,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{err2Ups, err1Ups},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():    1759,
-			slowerUps.Address():  10,
-			fastestUps.Address(): 8232,
+			fastUps.Address():    1075,
+			slowerUps.Address():  17,
+			fastestUps.Address(): 8909,
 		},
 		// The single failure has decayed away.
 		wantRTT: map[string]time.Duration{
@@ -197,9 +200,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{fastUps, slowerUps, fastestUps},
 	}, {
 		wantStat: map[string]int64{
-			each200.Address(): 5600,
-			each100.Address(): 2861,
-			each50.Address():  1627,
+			each200.Address(): 5400,
+			each100.Address(): 3139,
+			each50.Address():  1550,
 		},
 		name:    "error_each_nth",
 		servers: []upstream.Upstream{each200, each100, each50},
@@ -242,73 +245,80 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 
 			assert.Equal(t, wantStat, stats)
 
+			// A constant RTT scores 3/4 of itself: (p90/2 + mean)/2.
 			for addr, rtt := range wantRTT {
-				got := p.upstreamRTTStats[addr].ewma
-				assert.InEpsilon(t, float64(rtt.Microseconds()), got, 1e-3, addr)
+				got := p.upstreamRTTStats[addr].score
+				assert.InEpsilon(t, 0.75*float64(rtt.Microseconds()), got, 1e-3, addr)
 			}
 		})
 	}
 }
 
-func TestUpstreamRTTStats_update(t *testing.T) {
+func TestRingScore(t *testing.T) {
 	t.Parallel()
 
-	const (
-		tau     = 10 * time.Second
-		prevRTT = 100 * time.Millisecond
-		newRTT  = 10 * time.Millisecond
-	)
-
-	prevUS := float64(prevRTT.Microseconds())
-	newUS := float64(newRTT.Microseconds())
-
-	start := time.Unix(0, 0)
-	prev := upstreamRTTStats{
-		last: start,
-		ewma: prevUS,
-	}
-
 	testCases := []struct {
-		now      time.Time
-		name     string
-		stats    upstreamRTTStats
-		wantEWMA float64
+		name    string
+		samples []float64
+		want    float64
 	}{{
-		now:      start,
-		stats:    upstreamRTTStats{},
-		name:     "first_sample",
-		wantEWMA: newUS,
+		name:    "single",
+		samples: []float64{4_000},
+		want:    3_000,
 	}, {
-		now:      start,
-		stats:    prev,
-		name:     "no_time_passed",
-		wantEWMA: prevUS,
+		name:    "constant",
+		samples: []float64{2_000, 2_000, 2_000},
+		want:    1_500,
 	}, {
-		now:      start.Add(-time.Second),
-		stats:    prev,
-		name:     "clock_backwards",
-		wantEWMA: prevUS,
+		// mean 5.5, p90 at rank 8.1 of 0..9: 9.1.
+		name:    "interpolated",
+		samples: []float64{10, 1, 9, 2, 8, 3, 7, 4, 6, 5},
+		want:    (9.1/2 + 5.5) / 2,
 	}, {
-		now:      start.Add(tau),
-		stats:    prev,
-		name:     "one_tau",
-		wantEWMA: newUS + (prevUS-newUS)/math.E,
-	}, {
-		now:      start.Add(100 * tau),
-		stats:    prev,
-		name:     "long_ago",
-		wantEWMA: newUS,
+		// One slow answer of 16 moves the mean by 1/16 of it and p90 not at
+		// all.
+		name:    "outlier",
+		samples: append(slices.Repeat([]float64{1_000}, 15), 17_000),
+		want:    (1_000/2 + 2_000) / 2,
 	}}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := tc.stats.update(newRTT, tc.now, tau)
-			assert.InDelta(t, tc.wantEWMA, got.ewma, 1e-6)
-			assert.Equal(t, tc.now, got.last)
+			samples := slices.Clone(tc.samples)
+			assert.InDelta(t, tc.want, ringScore(tc.samples), 1e-9)
+			assert.Equal(t, samples, tc.samples, "samples must not be modified")
 		})
 	}
+}
+
+func TestUpstreamRTTStats_push(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(0, 0)
+
+	t.Run("first_sample", func(t *testing.T) {
+		t.Parallel()
+
+		got := upstreamRTTStats{}.push(4*time.Millisecond, start)
+		assert.Equal(t, start, got.last)
+		assert.Equal(t, 1, got.ringLen)
+		assert.InDelta(t, 3_000, got.score, 1e-9)
+	})
+
+	t.Run("wraps", func(t *testing.T) {
+		t.Parallel()
+
+		stats := upstreamRTTStats{}
+		for i := range 20 {
+			stats = stats.push(time.Duration(i+1)*time.Millisecond, start)
+		}
+
+		// Only 5..20 ms remain: mean 12.5, p90 at rank 13.5 of 0..15: 18.5.
+		assert.Equal(t, upstreamRTTRingSize, stats.ringLen)
+		assert.InDelta(t, (18_500.0/2+12_500)/2, stats.score, 1e-9)
+	})
 }
 
 func TestProxy_exchangeUpstreams_failurePenalty(t *testing.T) {
@@ -344,7 +354,12 @@ func TestProxy_exchangeUpstreams_failurePenalty(t *testing.T) {
 	require.Error(t, err)
 
 	for _, u := range ups {
-		assert.Equal(t, float64(upsTimeout.Microseconds()), p.upstreamRTTStats[u.Address()].ewma)
+		stat := p.upstreamRTTStats[u.Address()]
+		assert.Equal(t, uint(1), stat.fails)
+		assert.Zero(t, stat.ringLen)
+
+		est := stat.estimate(stat.failLast, p.upstreamRTTDecay, p.upstreamTimeout)
+		assert.Equal(t, float64(upsTimeout.Microseconds()), est)
 	}
 }
 
@@ -443,18 +458,26 @@ func TestUpstreamRTTStats_estimate(t *testing.T) {
 	t.Parallel()
 
 	const (
-		tau  = 10 * time.Second
-		ewma = 5_000_000.0
-		base = 10_000.0
+		tau     = 10 * time.Second
+		timeout = 5 * time.Second
+		score   = 4_000.0
+		base    = 10_000.0
 	)
 
+	timeoutUS := float64(timeout.Microseconds())
 	start := time.Unix(0, 0)
 	stats := upstreamRTTStats{
 		last:    start,
-		ewma:    ewma,
+		score:   score,
 		base:    base,
 		baseNum: upstreamRTTBaselineMin,
+		ringLen: upstreamRTTRingSize,
 	}
+
+	// failing has answered at start and failed one pull later.
+	failing := stats
+	failing.fails = 1
+	failing.failLast = start.Add(-failing.pullDecay(tau))
 
 	testCases := []struct {
 		now   time.Time
@@ -462,42 +485,112 @@ func TestUpstreamRTTStats_estimate(t *testing.T) {
 		stats upstreamRTTStats
 		want  float64
 	}{{
-		now:   start.Add(100 * tau),
-		stats: upstreamRTTStats{last: start, ewma: ewma},
-		name:  "no_baseline",
-		want:  ewma,
+		now:   start,
+		stats: upstreamRTTStats{},
+		name:  "unmeasured",
+		want:  timeoutUS,
 	}, {
 		now:   start.Add(100 * tau),
-		stats: upstreamRTTStats{last: start, ewma: ewma, base: base, baseNum: upstreamRTTBaselineMin - 1},
-		name:  "warming_up",
-		want:  ewma,
+		stats: upstreamRTTStats{last: start, score: score, ringLen: 1, base: base, baseNum: upstreamRTTBaselineMin - 1},
+		name:  "no_baseline",
+		want:  score,
 	}, {
 		now:   start,
 		stats: stats,
 		name:  "fresh",
-		want:  ewma,
+		want:  score,
 	}, {
 		now:   start.Add(-time.Second),
 		stats: stats,
 		name:  "clock_backwards",
-		want:  ewma,
+		want:  score,
 	}, {
 		now:   start.Add(tau),
 		stats: stats,
 		name:  "one_tau",
-		want:  base + (ewma-base)/math.E,
+		want:  base + (score-base)/math.E,
 	}, {
 		now:   start.Add(100 * tau),
 		stats: stats,
 		name:  "stale",
 		want:  base,
+	}, {
+		now:   start,
+		stats: upstreamRTTStats{fails: 1, failLast: start},
+		name:  "never_answered_failed",
+		want:  timeoutUS,
+	}, {
+		now:   start,
+		stats: failing,
+		name:  "failure_one_pull",
+		want:  score + (timeoutUS-score)/math.E,
+	}, {
+		now:   start,
+		stats: upstreamRTTStats{last: start, ringLen: 1},
+		name:  "sub_microsecond",
+		want:  1,
 	}}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			assert.InDelta(t, tc.want, tc.stats.estimate(tc.now, tau), 1e-6)
+			assert.InDelta(t, tc.want, tc.stats.estimate(tc.now, tau, timeout), 1e-6)
+		})
+	}
+}
+
+func TestUpstreamRTTStats_fill(t *testing.T) {
+	t.Parallel()
+
+	const tau = 10 * time.Second
+
+	start := time.Unix(0, 0)
+	failed := upstreamRTTStats{fails: 1, failLast: start}
+	pull := failed.pullDecay(tau)
+
+	testCases := []struct {
+		now   time.Time
+		name  string
+		stats upstreamRTTStats
+		want  float64
+	}{{
+		now:   start,
+		stats: upstreamRTTStats{},
+		name:  "empty",
+		want:  1,
+	}, {
+		now:   start,
+		stats: upstreamRTTStats{ringLen: upstreamRTTRingSize / 2},
+		name:  "half",
+		want:  0.5,
+	}, {
+		now:   start,
+		stats: upstreamRTTStats{ringLen: upstreamRTTRingSize},
+		name:  "full",
+		want:  0,
+	}, {
+		now:   start,
+		stats: failed,
+		name:  "failed_fresh",
+		want:  0,
+	}, {
+		now:   start.Add(pull),
+		stats: failed,
+		name:  "failed_one_pull",
+		want:  1 - 1/math.E,
+	}, {
+		now:   start.Add(100 * pull),
+		stats: failed,
+		name:  "failed_stale",
+		want:  1,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.InDelta(t, tc.want, tc.stats.fill(tc.now, tau), 1e-9)
 		})
 	}
 }
@@ -529,59 +622,72 @@ func TestProxy_calcWeights(t *testing.T) {
 
 	ctx := testutil.ContextWithTimeout(t, defaultTimeout)
 
+	full := func(score float64) (s upstreamRTTStats) {
+		return upstreamRTTStats{
+			last:    now,
+			score:   score,
+			base:    score,
+			baseNum: upstreamRTTBaselineMin,
+			ringLen: upstreamRTTRingSize,
+		}
+	}
+
 	t.Run("exponent", func(t *testing.T) {
-		p.upstreamRTTStats["fast"] = upstreamRTTStats{last: now, ewma: 1_000, base: 1_000, baseNum: upstreamRTTBaselineMin}
-		p.upstreamRTTStats["slow"] = upstreamRTTStats{last: now, ewma: 2_000, base: 2_000, baseNum: upstreamRTTBaselineMin}
+		p.upstreamRTTStats["fast"] = full(1_000)
+		p.upstreamRTTStats["slow"] = full(2_000)
 
 		w := p.calcWeights(ctx, ups)
 		require.Len(t, w, len(ups))
 
 		// Twice as slow gets an eighth of the weight, and an unmeasured
-		// upstream is tried first.
+		// upstream, with an empty ring, gets the uniform share.
 		assert.InDelta(t, 8, w[0]/w[1], 1e-9)
-		assert.Greater(t, w[2], 0.99)
+		assert.InDelta(t, 1.0/3, w[2], 1e-9)
 	})
 
-	// failed is an upstream whose only exchange failed, so it has no
-	// baseline.
-	failed := upstreamRTTStats{ewma: float64(defaultTimeout.Microseconds())}
 	measured := []upstream.Upstream{ups[0], ups[1]}
-	p.upstreamRTTStats["fast"] = upstreamRTTStats{last: now, ewma: 1_000, base: 1_000, baseNum: upstreamRTTBaselineMin}
+	p.upstreamRTTStats["fast"] = full(1_000)
 
-	t.Run("no_baseline_fresh", func(t *testing.T) {
-		failed.last = now
+	t.Run("filling", func(t *testing.T) {
+		// Half the ring is empty, so half the weight is the uniform share.
+		half := full(2_000)
+		half.ringLen = upstreamRTTRingSize / 2
+		p.upstreamRTTStats["slow"] = half
+
+		w := p.calcWeights(ctx, measured)
+		assert.InDelta(t, 0.5*(1.0/9)+0.5*0.5, w[1], 1e-9)
+	})
+
+	// failed is an upstream whose only exchange failed.
+	failed := upstreamRTTStats{fails: 1}
+
+	t.Run("failed_fresh", func(t *testing.T) {
+		failed.failLast = now
 		p.upstreamRTTStats["slow"] = failed
 
 		w := p.calcWeights(ctx, measured)
 		assert.Less(t, w[1], 1e-6)
 	})
 
-	t.Run("no_baseline_stale", func(t *testing.T) {
-		failed.last = now.Add(-100 * p.upstreamRTTDecay)
+	t.Run("failed_stale", func(t *testing.T) {
+		failed.failLast = now.Add(-100 * failed.pullDecay(p.upstreamRTTDecay))
 		p.upstreamRTTStats["slow"] = failed
 
 		w := p.calcWeights(ctx, measured)
 		assert.InDelta(t, 0.5, w[1], 1e-6)
 	})
 
-	t.Run("slow_first_answer_stale", func(t *testing.T) {
-		// A single slow answer doesn't exclude the upstream: until its
-		// baseline is complete, it's pulled towards 1/2 like the above.
-		p.upstreamRTTStats["slow"] = upstreamRTTStats{
-			last:     now.Add(-100 * p.upstreamRTTDecay),
-			ewma:     500_000,
-			baseLast: now.Add(-100 * p.upstreamRTTDecay),
-			base:     500_000,
-			baseNum:  1,
-			baseMax:  500_000,
-		}
+	t.Run("slow_first_answer", func(t *testing.T) {
+		// A single slow answer doesn't exclude the upstream: 15 of its 16
+		// slots are empty, so it gets 15/16 of the uniform share.
+		p.upstreamRTTStats["slow"] = upstreamRTTStats{}.push(500*time.Millisecond, now)
 
 		w := p.calcWeights(ctx, measured)
-		assert.InDelta(t, 0.5, w[1], 1e-6)
+		assert.InDelta(t, 15.0/16*0.5, w[1], 1e-6)
 	})
 }
 
-func TestProxy_updateRTT_baseline(t *testing.T) {
+func TestProxy_updateRTT(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -603,20 +709,22 @@ func TestProxy_updateRTT_baseline(t *testing.T) {
 
 	ctx := testutil.ContextWithTimeout(t, defaultTimeout)
 
-	// A failure updates the moving average but not the baseline.
+	// A failure updates neither the ring nor the baseline.
 	p.updateRTT(ctx, addr, p.upstreamTimeout, false)
 	stat := p.upstreamRTTStats[addr]
-	assert.Equal(t, float64(p.upstreamTimeout.Microseconds()), stat.ewma)
+	assert.Zero(t, stat.ringLen)
 	assert.Zero(t, stat.base)
 	assert.Zero(t, stat.baseNum)
-
 	assert.Equal(t, uint(1), stat.fails)
+	assert.False(t, stat.failLast.IsZero())
 
 	p.updateRTT(ctx, addr, p.upstreamTimeout, false)
 	assert.Equal(t, uint(2), p.upstreamRTTStats[addr].fails)
 
 	p.updateRTT(ctx, addr, rtt, true)
 	stat = p.upstreamRTTStats[addr]
+	assert.Equal(t, 1, stat.ringLen)
+	assert.InDelta(t, 0.75*float64(rtt.Microseconds()), stat.score, 1e-9)
 	assert.Equal(t, float64(rtt.Microseconds()), stat.base)
 	assert.Equal(t, 1.0, stat.baseNum)
 	assert.Zero(t, stat.fails)
@@ -625,28 +733,24 @@ func TestProxy_updateRTT_baseline(t *testing.T) {
 func TestUpstreamRTTStats_pullDecay(t *testing.T) {
 	t.Parallel()
 
-	const tau = 5 * time.Minute
+	const tau = 2 * time.Minute
 
 	testCases := []struct {
 		name  string
 		fails uint
 		want  time.Duration
 	}{{
-		name:  "healthy",
-		fails: 0,
-		want:  tau,
-	}, {
 		name:  "one_failure",
 		fails: 1,
-		want:  tau,
+		want:  upstreamRTTFailPull * tau,
 	}, {
 		name:  "two_failures",
 		fails: 2,
-		want:  2 * tau,
+		want:  2 * upstreamRTTFailPull * tau,
 	}, {
 		name:  "four_failures",
 		fails: 4,
-		want:  8 * tau,
+		want:  8 * upstreamRTTFailPull * tau,
 	}, {
 		name:  "capped",
 		fails: 1_000,

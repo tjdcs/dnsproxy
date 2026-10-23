@@ -179,10 +179,11 @@ type Config struct {
 	// Non-positive value will be replaced with the default one.
 	FastestPingTimeout time.Duration
 
-	// UpstreamRTTDecay is the time constant of the exponentially weighted
-	// moving average of upstreams' round-trip times, used to weight upstreams
-	// in [UpstreamModeLoadBalance].  A sample's weight decays by a factor of e
-	// per UpstreamRTTDecay.  It must not be negative.  Default value is
+	// UpstreamRTTDecay is the time constant used to weight upstreams in
+	// [UpstreamModeLoadBalance].  An upstream's score, from its latest
+	// round-trip times, is pulled towards its long-term average by a factor of
+	// e per UpstreamRTTDecay since its latest answer, and a failure's penalty
+	// fades over a multiple of it.  It must not be negative.  Default value is
 	// [DefaultUpstreamRTTDecay].
 	UpstreamRTTDecay time.Duration
 

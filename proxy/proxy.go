@@ -301,8 +301,9 @@ type Proxy struct {
 	// when cache is optimistic.  Default value is [DefaultOptimisticMaxAge].
 	cacheOptimisticMaxAge time.Duration
 
-	// upstreamRTTDecay is the time constant of the upstreams' round-trip time
-	// moving average.  Default value is [DefaultUpstreamRTTDecay].
+	// upstreamRTTDecay is the time constant of the pull of the upstreams'
+	// round-trip time scores towards their long-term averages.  Default value
+	// is [DefaultUpstreamRTTDecay].
 	upstreamRTTDecay time.Duration
 
 	// upstreamTimeout is recorded as the round-trip time of a failed exchange.
