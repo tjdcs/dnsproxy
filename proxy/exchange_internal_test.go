@@ -153,9 +153,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 	}{{
 		wantStat: map[string]int64{
 			// Shares go as RTT^-3: 10x slower gets about 1/1000.
-			fastUps.Address():    9991,
-			slowerUps.Address():  8,
-			slowestUps.Address(): 1,
+			fastUps.Address():    9983,
+			slowerUps.Address():  12,
+			slowestUps.Address(): 5,
 		},
 		wantRTT: map[string]time.Duration{
 			fastUps.Address():    testRTT / 100,
@@ -166,8 +166,8 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{slowestUps, slowerUps, fastUps},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():   9988,
-			slowerUps.Address(): 12,
+			fastUps.Address():   9984,
+			slowerUps.Address(): 16,
 			// Never answered, so no baseline: its weight is pulled
 			// towards 1/3 between failures, slower after each one.
 			err1Ups.Address(): 32,
@@ -183,9 +183,9 @@ func TestProxy_Exchange_loadBalance(t *testing.T) {
 		servers: []upstream.Upstream{err2Ups, err1Ups},
 	}, {
 		wantStat: map[string]int64{
-			fastUps.Address():    1772,
-			slowerUps.Address():  5,
-			fastestUps.Address(): 8224,
+			fastUps.Address():    1764,
+			slowerUps.Address():  9,
+			fastestUps.Address(): 8228,
 		},
 		// The single failure has decayed away.
 		wantRTT: map[string]time.Duration{
@@ -270,8 +270,8 @@ func TestUpstreamRTTStats_update(t *testing.T) {
 
 	testCases := []struct {
 		now      time.Time
-		stats    upstreamRTTStats
 		name     string
+		stats    upstreamRTTStats
 		wantEWMA float64
 	}{{
 		now:      start,
@@ -365,6 +365,19 @@ func TestUpstreamRTTStats_updateBase(t *testing.T) {
 		baseLast: start,
 		base:     prevUS,
 		baseNum:  1,
+		baseMax:  prevUS,
+	}
+	// lastWarmUp holds a slow first answer and three fast ones.
+	lastWarmUp := upstreamRTTStats{
+		baseLast: start,
+		base:     (5*prevUS + 3*newUS) / 4,
+		baseNum:  upstreamRTTBaselineMin - 1,
+		baseMax:  5 * prevUS,
+	}
+	warmedUp := upstreamRTTStats{
+		baseLast: start,
+		base:     prevUS,
+		baseNum:  upstreamRTTBaselineMin,
 	}
 	warm := upstreamRTTStats{
 		baseLast: start,
@@ -374,8 +387,8 @@ func TestUpstreamRTTStats_updateBase(t *testing.T) {
 
 	testCases := []struct {
 		now      time.Time
-		stats    upstreamRTTStats
 		name     string
+		stats    upstreamRTTStats
 		wantBase float64
 	}{{
 		now:      start,
@@ -390,7 +403,17 @@ func TestUpstreamRTTStats_updateBase(t *testing.T) {
 	}, {
 		now:      start.Add(tau),
 		stats:    warmingUp,
-		name:     "warm_up_decay_wins",
+		name:     "warm_up_ignores_decay",
+		wantBase: (prevUS + newUS) / 2,
+	}, {
+		now:      start.Add(tau),
+		stats:    lastWarmUp,
+		name:     "warm_up_drops_largest",
+		wantBase: newUS,
+	}, {
+		now:      start.Add(tau),
+		stats:    warmedUp,
+		name:     "warmed_up_decay_wins",
 		wantBase: newUS + (prevUS-newUS)/math.E,
 	}, {
 		now:      start,
@@ -430,18 +453,23 @@ func TestUpstreamRTTStats_estimate(t *testing.T) {
 		last:    start,
 		ewma:    ewma,
 		base:    base,
-		baseNum: 1,
+		baseNum: upstreamRTTBaselineMin,
 	}
 
 	testCases := []struct {
 		now   time.Time
-		stats upstreamRTTStats
 		name  string
+		stats upstreamRTTStats
 		want  float64
 	}{{
 		now:   start.Add(100 * tau),
 		stats: upstreamRTTStats{last: start, ewma: ewma},
 		name:  "no_baseline",
+		want:  ewma,
+	}, {
+		now:   start.Add(100 * tau),
+		stats: upstreamRTTStats{last: start, ewma: ewma, base: base, baseNum: upstreamRTTBaselineMin - 1},
+		name:  "warming_up",
 		want:  ewma,
 	}, {
 		now:   start,
@@ -502,8 +530,8 @@ func TestProxy_calcWeights(t *testing.T) {
 	ctx := testutil.ContextWithTimeout(t, defaultTimeout)
 
 	t.Run("exponent", func(t *testing.T) {
-		p.upstreamRTTStats["fast"] = upstreamRTTStats{last: now, ewma: 1_000, base: 1_000, baseNum: 1}
-		p.upstreamRTTStats["slow"] = upstreamRTTStats{last: now, ewma: 2_000, base: 2_000, baseNum: 1}
+		p.upstreamRTTStats["fast"] = upstreamRTTStats{last: now, ewma: 1_000, base: 1_000, baseNum: upstreamRTTBaselineMin}
+		p.upstreamRTTStats["slow"] = upstreamRTTStats{last: now, ewma: 2_000, base: 2_000, baseNum: upstreamRTTBaselineMin}
 
 		w := p.calcWeights(ctx, ups)
 		require.Len(t, w, len(ups))
@@ -518,7 +546,7 @@ func TestProxy_calcWeights(t *testing.T) {
 	// baseline.
 	failed := upstreamRTTStats{ewma: float64(defaultTimeout.Microseconds())}
 	measured := []upstream.Upstream{ups[0], ups[1]}
-	p.upstreamRTTStats["fast"] = upstreamRTTStats{last: now, ewma: 1_000, base: 1_000, baseNum: 1}
+	p.upstreamRTTStats["fast"] = upstreamRTTStats{last: now, ewma: 1_000, base: 1_000, baseNum: upstreamRTTBaselineMin}
 
 	t.Run("no_baseline_fresh", func(t *testing.T) {
 		failed.last = now
@@ -531,6 +559,22 @@ func TestProxy_calcWeights(t *testing.T) {
 	t.Run("no_baseline_stale", func(t *testing.T) {
 		failed.last = now.Add(-100 * p.upstreamRTTDecay)
 		p.upstreamRTTStats["slow"] = failed
+
+		w := p.calcWeights(ctx, measured)
+		assert.InDelta(t, 0.5, w[1], 1e-6)
+	})
+
+	t.Run("slow_first_answer_stale", func(t *testing.T) {
+		// A single slow answer doesn't exclude the upstream: until its
+		// baseline is complete, it's pulled towards 1/2 like the above.
+		p.upstreamRTTStats["slow"] = upstreamRTTStats{
+			last:     now.Add(-100 * p.upstreamRTTDecay),
+			ewma:     500_000,
+			baseLast: now.Add(-100 * p.upstreamRTTDecay),
+			base:     500_000,
+			baseNum:  1,
+			baseMax:  500_000,
+		}
 
 		w := p.calcWeights(ctx, measured)
 		assert.InDelta(t, 0.5, w[1], 1e-6)

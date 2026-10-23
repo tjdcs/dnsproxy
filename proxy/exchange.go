@@ -29,6 +29,14 @@ const (
 	// is rarely chosen.
 	upstreamRTTBaselineDecay = 24 * time.Hour
 
+	// upstreamRTTBaselineMin is the number of successful exchanges before an
+	// upstream's baseline is used.  Until then its weight is pulled towards
+	// the uniform share, so that it's tried again, and the baseline then
+	// starts as the average of these samples without the largest one, so that
+	// a single slow answer, such as the first one over a new connection,
+	// doesn't keep the upstream out of use.
+	upstreamRTTBaselineMin = 5
+
 	// upstreamRTTMaxPullDecay is the upper bound of the time constant of the
 	// pull of a failing upstream's estimate, see
 	// [upstreamRTTStats.pullDecay].
@@ -135,13 +143,13 @@ type upstreamRTTStats struct {
 	// updates.
 	last time.Time
 
-	// ewma is the exponentially weighted moving average of the round-trip
-	// time in microseconds.
-	ewma float64
-
 	// baseLast is the time of the latest update of base.  It's zero if there
 	// were no updates.
 	baseLast time.Time
+
+	// ewma is the exponentially weighted moving average of the round-trip
+	// time in microseconds.
+	ewma float64
 
 	// base is the long-term moving average of the round-trip time of
 	// successful exchanges in microseconds.  It's zero if there were no
@@ -150,6 +158,10 @@ type upstreamRTTStats struct {
 
 	// baseNum is the number of samples in base.
 	baseNum float64
+
+	// baseMax is the largest of the first [upstreamRTTBaselineMin] samples
+	// in base, in microseconds.
+	baseMax float64
 
 	// fails is the number of consecutive failed exchanges.
 	fails uint
@@ -181,10 +193,12 @@ func (stats upstreamRTTStats) update(
 }
 
 // updateBase returns updated stats after adding given RTT of a successful
-// exchange measured at now to the baseline.  A sample's weight is the larger of
-// 1/n, for the n-th sample, and its time-decay weight, so that the baseline is
-// the plain average until it holds about tau's worth of samples.  Otherwise the
-// first sample would dominate it for a long time.  tau must be positive.
+// exchange measured at now to the baseline.  The baseline starts as the plain
+// average of the first [upstreamRTTBaselineMin] samples without the largest
+// one.  After that, a sample's weight is the larger of 1/n, for the n-th
+// sample, and its time-decay weight, so that the baseline stays the plain
+// average until it holds about tau's worth of samples.  Otherwise the first
+// samples would dominate it for a long time.  tau must be positive.
 func (stats upstreamRTTStats) updateBase(
 	rtt time.Duration,
 	now time.Time,
@@ -194,13 +208,20 @@ func (stats upstreamRTTStats) updateBase(
 	updated.baseLast = now
 	updated.baseNum++
 
-	w := 1 / updated.baseNum
-	if !stats.baseLast.IsZero() {
-		elapsed := max(now.Sub(stats.baseLast), 0)
-		w = max(w, -math.Expm1(-elapsed.Seconds()/tau.Seconds()))
+	sample := float64(rtt.Microseconds())
+	if updated.baseNum <= upstreamRTTBaselineMin {
+		updated.baseMax = max(stats.baseMax, sample)
+		updated.base = stats.base + (sample-stats.base)/updated.baseNum
+		if n := updated.baseNum; n == upstreamRTTBaselineMin {
+			updated.base = (n*updated.base - updated.baseMax) / (n - 1)
+		}
+
+		return updated
 	}
 
-	updated.base = stats.base + w*(float64(rtt.Microseconds())-stats.base)
+	elapsed := max(now.Sub(stats.baseLast), 0)
+	w := max(1/updated.baseNum, -math.Expm1(-elapsed.Seconds()/tau.Seconds()))
+	updated.base = stats.base + w*(sample-stats.base)
 
 	return updated
 }
@@ -221,11 +242,11 @@ func (stats upstreamRTTStats) pullDecay(tau time.Duration) (d time.Duration) {
 }
 
 // estimate returns the round-trip time estimate in microseconds at now.  The
-// moving average is pulled towards the baseline, if any, as it gets older, by
-// a factor of e per [upstreamRTTStats.pullDecay] of tau.  tau must be
-// positive.
+// moving average is pulled towards the baseline, once it holds
+// [upstreamRTTBaselineMin] samples, as it gets older, by a factor of e per
+// [upstreamRTTStats.pullDecay] of tau.  tau must be positive.
 func (stats upstreamRTTStats) estimate(now time.Time, tau time.Duration) (est float64) {
-	if stats.baseNum == 0 {
+	if stats.baseNum < upstreamRTTBaselineMin {
 		return stats.ewma
 	}
 
@@ -239,14 +260,15 @@ func (stats upstreamRTTStats) estimate(now time.Time, tau time.Duration) (est fl
 // with the same index in the given slice, normalized to sum to 1 before the
 // pull described below.  ups elements must not be nil.
 //
-// An upstream that has been measured but has no baseline, since it never
-// answered successfully, has its weight pulled towards 1/len(ups) by a factor
-// of e per [upstreamRTTStats.pullDecay] since its latest update.  Otherwise a
-// failure on its first exchange would exclude it until restart.
+// An upstream that has been measured but has no baseline yet, since it hasn't
+// answered successfully [upstreamRTTBaselineMin] times, has its weight pulled
+// towards 1/len(ups) by a factor of e per [upstreamRTTStats.pullDecay] since
+// its latest update.  Otherwise a failure or a slow answer on its first
+// exchanges would exclude it until restart.
 func (p *Proxy) calcWeights(ctx context.Context, ups []upstream.Upstream) (weights []float64) {
 	weights = make([]float64, 0, len(ups))
 	// pull is the weight of the current value for upstreams without a
-	// baseline, -1 for the rest.
+	// complete baseline, -1 for the rest.
 	pull := make([]float64, 0, len(ups))
 
 	now := p.time.Now()
@@ -259,7 +281,7 @@ func (p *Proxy) calcWeights(ctx context.Context, ups []upstream.Upstream) (weigh
 			// Use 1 as the default weight.
 			weights = append(weights, 1)
 			pull = append(pull, -1)
-		case stat.baseNum == 0:
+		case stat.baseNum < upstreamRTTBaselineMin:
 			weights = append(weights, math.Pow(stat.ewma, -upstreamRTTExponent))
 			age := max(now.Sub(stat.last), 0)
 			tau := stat.pullDecay(p.upstreamRTTDecay)
