@@ -193,17 +193,14 @@ type upstreamRTTStats struct {
 	fails uint
 }
 
-// push returns updated stats after adding given RTT of a successful exchange
-// measured at now to the ring, replacing the oldest sample once it's full.
-func (stats upstreamRTTStats) push(rtt time.Duration, now time.Time) (updated upstreamRTTStats) {
-	updated = stats
-	updated.last = now
-	updated.ring[stats.ringNext] = float64(rtt.Microseconds())
-	updated.ringNext = (stats.ringNext + 1) % upstreamRTTRingSize
-	updated.ringLen = min(stats.ringLen+1, upstreamRTTRingSize)
-	updated.score = ringScore(updated.ring[:updated.ringLen])
-
-	return updated
+// push adds given RTT of a successful exchange measured at now to the ring,
+// replacing the oldest sample once it's full.
+func (stats *upstreamRTTStats) push(rtt time.Duration, now time.Time) {
+	stats.last = now
+	stats.ring[stats.ringNext] = float64(rtt.Microseconds())
+	stats.ringNext = (stats.ringNext + 1) % upstreamRTTRingSize
+	stats.ringLen = min(stats.ringLen+1, upstreamRTTRingSize)
+	stats.score = ringScore(stats.ring[:stats.ringLen])
 }
 
 // ringScore returns (p90/2 + mean)/2 of samples, where p90 is their 90th
@@ -234,38 +231,31 @@ func ringScore(samples []float64) (score float64) {
 	return (p90/2 + mean) / 2
 }
 
-// updateBase returns updated stats after adding given RTT of a successful
-// exchange measured at now to the baseline.  The baseline starts as the plain
+// updateBase adds given RTT of a successful exchange measured at now to the
+// baseline.  The baseline starts as the plain
 // average of the first [upstreamRTTBaselineMin] samples without the largest
 // one.  After that, a sample's weight is the larger of 1/n, for the n-th
 // sample, and its time-decay weight, so that the baseline stays the plain
 // average until it holds about tau's worth of samples.  Otherwise the first
 // samples would dominate it for a long time.  tau must be positive.
-func (stats upstreamRTTStats) updateBase(
-	rtt time.Duration,
-	now time.Time,
-	tau time.Duration,
-) (updated upstreamRTTStats) {
-	updated = stats
-	updated.baseLast = now
-	updated.baseNum++
+func (stats *upstreamRTTStats) updateBase(rtt time.Duration, now time.Time, tau time.Duration) {
+	elapsed := max(now.Sub(stats.baseLast), 0)
+	stats.baseLast = now
+	stats.baseNum++
 
 	sample := float64(rtt.Microseconds())
-	if updated.baseNum <= upstreamRTTBaselineMin {
-		updated.baseMax = max(stats.baseMax, sample)
-		updated.base = stats.base + (sample-stats.base)/updated.baseNum
-		if n := updated.baseNum; n == upstreamRTTBaselineMin {
-			updated.base = (n*updated.base - updated.baseMax) / (n - 1)
+	if stats.baseNum <= upstreamRTTBaselineMin {
+		stats.baseMax = max(stats.baseMax, sample)
+		stats.base += (sample - stats.base) / stats.baseNum
+		if n := stats.baseNum; n == upstreamRTTBaselineMin {
+			stats.base = (n*stats.base - stats.baseMax) / (n - 1)
 		}
 
-		return updated
+		return
 	}
 
-	elapsed := max(now.Sub(stats.baseLast), 0)
-	w := max(1/updated.baseNum, -math.Expm1(-elapsed.Seconds()/tau.Seconds()))
-	updated.base = stats.base + w*(sample-stats.base)
-
-	return updated
+	w := max(1/stats.baseNum, -math.Expm1(-elapsed.Seconds()/tau.Seconds()))
+	stats.base += w * (sample - stats.base)
 }
 
 // pullDecay returns the time constant of the pull of a failing upstream's
@@ -274,7 +264,7 @@ func (stats upstreamRTTStats) updateBase(
 // first failure and doubles with each consecutive one after that, up to
 // [upstreamRTTMaxPullDecay], so that a dead upstream is retried less and less
 // often.  tau must be positive.
-func (stats upstreamRTTStats) pullDecay(tau time.Duration) (d time.Duration) {
+func (stats *upstreamRTTStats) pullDecay(tau time.Duration) (d time.Duration) {
 	d = upstreamRTTFailPull * tau
 	for i := uint(1); i < stats.fails && d < upstreamRTTMaxPullDecay; i++ {
 		d *= 2
@@ -293,7 +283,7 @@ func (stats upstreamRTTStats) pullDecay(tau time.Duration) (d time.Duration) {
 //     per [upstreamRTTStats.pullDecay] of tau since the latest failure.
 //
 // tau and timeout must be positive.
-func (stats upstreamRTTStats) estimate(now time.Time, tau, timeout time.Duration) (est float64) {
+func (stats *upstreamRTTStats) estimate(now time.Time, tau, timeout time.Duration) (est float64) {
 	timeoutUS := float64(timeout.Microseconds())
 
 	est = timeoutUS
@@ -321,7 +311,7 @@ func (stats upstreamRTTStats) estimate(now time.Time, tau, timeout time.Duration
 // new upstream is filled, and after a failure, that fraction scaled by 1 -
 // e^(-age/d), where age is the time since the latest failure and d is
 // [upstreamRTTStats.pullDecay] of tau.  tau must be positive.
-func (stats upstreamRTTStats) fill(now time.Time, tau time.Duration) (f float64) {
+func (stats *upstreamRTTStats) fill(now time.Time, tau time.Duration) (f float64) {
 	f = float64(upstreamRTTRingSize-stats.ringLen) / upstreamRTTRingSize
 	if stats.fails > 0 {
 		age := max(now.Sub(stats.failLast), 0)
@@ -342,9 +332,16 @@ func (p *Proxy) calcWeights(ctx context.Context, ups []upstream.Upstream) (weigh
 
 	now := p.time.Now()
 
+	// unmeasured stands in for the upstreams without statistics.
+	var unmeasured upstreamRTTStats
+
 	p.rttLock.Lock()
 	for _, u := range ups {
 		stat := p.upstreamRTTStats[u.Address()]
+		if stat == nil {
+			stat = &unmeasured
+		}
+
 		est := stat.estimate(now, p.upstreamRTTDecay, p.upstreamTimeout)
 		weights = append(weights, math.Pow(est, -upstreamRTTExponent))
 		fill = append(fill, stat.fill(now, p.upstreamRTTDecay))
@@ -396,19 +393,26 @@ func (p *Proxy) updateRTT(ctx context.Context, address string, rtt time.Duration
 
 	p.rttLock.Lock()
 	if p.upstreamRTTStats == nil {
-		p.upstreamRTTStats = map[string]upstreamRTTStats{}
+		p.upstreamRTTStats = map[string]*upstreamRTTStats{}
 	}
 
-	updated := p.upstreamRTTStats[address]
-	if ok {
-		updated = updated.push(rtt, now)
-		updated = updated.updateBase(rtt, now, upstreamRTTBaselineDecay)
-		updated.fails = 0
-	} else {
-		updated.fails++
-		updated.failLast = now
+	stats := p.upstreamRTTStats[address]
+	if stats == nil {
+		stats = &upstreamRTTStats{}
+		p.upstreamRTTStats[address] = stats
 	}
-	p.upstreamRTTStats[address] = updated
+
+	if ok {
+		stats.push(rtt, now)
+		stats.updateBase(rtt, now, upstreamRTTBaselineDecay)
+		stats.fails = 0
+	} else {
+		stats.fails++
+		stats.failLast = now
+	}
+
+	// Copy the logged values under the lock.
+	score, samples, base, fails := stats.score, stats.ringLen, stats.base, stats.fails
 	p.rttLock.Unlock()
 
 	p.logger.DebugContext(
@@ -417,10 +421,10 @@ func (p *Proxy) updateRTT(ctx context.Context, address string, rtt time.Duration
 		"upstream", address,
 		"rtt", rtt,
 		"ok", ok,
-		"score", usDuration(updated.score),
-		"samples", updated.ringLen,
-		"base", usDuration(updated.base),
-		"fails", updated.fails,
+		"score", usDuration(score),
+		"samples", samples,
+		"base", usDuration(base),
+		"fails", fails,
 	)
 }
 

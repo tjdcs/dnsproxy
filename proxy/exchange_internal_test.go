@@ -301,7 +301,8 @@ func TestUpstreamRTTStats_push(t *testing.T) {
 	t.Run("first_sample", func(t *testing.T) {
 		t.Parallel()
 
-		got := upstreamRTTStats{}.push(4*time.Millisecond, start)
+		got := &upstreamRTTStats{}
+		got.push(4*time.Millisecond, start)
 		assert.Equal(t, start, got.last)
 		assert.Equal(t, 1, got.ringLen)
 		assert.InDelta(t, 3_000, got.score, 1e-9)
@@ -310,9 +311,9 @@ func TestUpstreamRTTStats_push(t *testing.T) {
 	t.Run("wraps", func(t *testing.T) {
 		t.Parallel()
 
-		stats := upstreamRTTStats{}
+		stats := &upstreamRTTStats{}
 		for i := range 20 {
-			stats = stats.push(time.Duration(i+1)*time.Millisecond, start)
+			stats.push(time.Duration(i+1)*time.Millisecond, start)
 		}
 
 		// Only 5..20 ms remain: mean 12.5, p90 at rank 13.5 of 0..15: 18.5.
@@ -446,7 +447,8 @@ func TestUpstreamRTTStats_updateBase(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := tc.stats.updateBase(newRTT, tc.now, tau)
+			got := tc.stats
+			got.updateBase(newRTT, tc.now, tau)
 			assert.InDelta(t, tc.wantBase, got.base, 1e-6)
 			assert.Equal(t, tc.now, got.baseLast)
 			assert.Equal(t, tc.stats.baseNum+1, got.baseNum)
@@ -622,8 +624,8 @@ func TestProxy_calcWeights(t *testing.T) {
 
 	ctx := testutil.ContextWithTimeout(t, defaultTimeout)
 
-	full := func(score float64) (s upstreamRTTStats) {
-		return upstreamRTTStats{
+	full := func(score float64) (s *upstreamRTTStats) {
+		return &upstreamRTTStats{
 			last:    now,
 			score:   score,
 			base:    score,
@@ -659,7 +661,7 @@ func TestProxy_calcWeights(t *testing.T) {
 	})
 
 	// failed is an upstream whose only exchange failed.
-	failed := upstreamRTTStats{fails: 1}
+	failed := &upstreamRTTStats{fails: 1}
 
 	t.Run("failed_fresh", func(t *testing.T) {
 		failed.failLast = now
@@ -680,7 +682,9 @@ func TestProxy_calcWeights(t *testing.T) {
 	t.Run("slow_first_answer", func(t *testing.T) {
 		// A single slow answer doesn't exclude the upstream: 15 of its 16
 		// slots are empty, so it gets 15/16 of the uniform share.
-		p.upstreamRTTStats["slow"] = upstreamRTTStats{}.push(500*time.Millisecond, now)
+		slow := &upstreamRTTStats{}
+		slow.push(500*time.Millisecond, now)
+		p.upstreamRTTStats["slow"] = slow
 
 		w := p.calcWeights(ctx, measured)
 		assert.InDelta(t, 15.0/16*0.5, w[1], 1e-6)

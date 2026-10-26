@@ -257,7 +257,7 @@ type Proxy struct {
 	// upstreamRTTStats maps the upstream address to its round-trip time
 	// statistics.  It's holds the statistics for all upstreams to perform a
 	// weighted random selection when using the load balancing mode.
-	upstreamRTTStats map[string]upstreamRTTStats
+	upstreamRTTStats map[string]*upstreamRTTStats
 
 	// quicListenAddr is the set of UDP addresses to listen for DNS-over-QUIC
 	// requests.
@@ -450,7 +450,7 @@ func New(c *Config) (p *Proxy, err error) {
 			contextutil.EmptyConstructor{},
 		),
 		requestHandler:   cmp.Or[Handler](c.RequestHandler, DefaultHandler{}),
-		upstreamRTTStats: map[string]upstreamRTTStats{},
+		upstreamRTTStats: map[string]*upstreamRTTStats{},
 		rttLock:          &sync.Mutex{},
 		mu:               &sync.RWMutex{},
 		// 2 bytes may be used to store packet length (see TCP/TLS).
