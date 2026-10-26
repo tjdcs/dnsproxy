@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -373,13 +374,19 @@ func formatWeights(ups []upstream.Upstream, weights []float64) (s string) {
 		sum += w
 	}
 
+	// num is the buffer for a formatted weight, such as "0.1667".
+	var num [16]byte
+
 	b := &strings.Builder{}
+	b.Grow(len(ups) * 48)
 	for i, u := range ups {
 		if i > 0 {
 			b.WriteByte(' ')
 		}
 
-		_, _ = fmt.Fprintf(b, "%s=%.4f", u.Address(), weights[i]/sum)
+		b.WriteString(u.Address())
+		b.WriteByte('=')
+		b.Write(strconv.AppendFloat(num[:0], weights[i]/sum, 'f', 4, 64))
 	}
 
 	return b.String()
@@ -414,6 +421,12 @@ func (p *Proxy) updateRTT(ctx context.Context, address string, rtt time.Duration
 	// Copy the logged values under the lock.
 	score, samples, base, fails := stats.score, stats.ringLen, stats.base, stats.fails
 	p.rttLock.Unlock()
+
+	// Check the level first, so that the arguments aren't converted to
+	// interface values when the line isn't logged.
+	if !p.logger.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
 
 	p.logger.DebugContext(
 		ctx,

@@ -691,6 +691,28 @@ func TestProxy_calcWeights(t *testing.T) {
 	})
 }
 
+func TestFormatWeights(t *testing.T) {
+	t.Parallel()
+
+	newUps := func(addr string) (u upstream.Upstream) {
+		return &testUpstream{
+			OnAddress: func() (a string) { return addr },
+		}
+	}
+
+	ups := []upstream.Upstream{
+		newUps("https://1.1.1.1:443/dns-query"),
+		newUps("https://8.8.8.8:443/dns-query"),
+		newUps("https://freedns.controld.com:443/p0"),
+	}
+
+	// The weights are normalized and have 4 decimals, as with "%.4f".
+	got := formatWeights(ups, []float64{2, 1, 1e-6})
+	assert.Equal(t, "https://1.1.1.1:443/dns-query=0.6667 "+
+		"https://8.8.8.8:443/dns-query=0.3333 "+
+		"https://freedns.controld.com:443/p0=0.0000", got)
+}
+
 func TestProxy_updateRTT(t *testing.T) {
 	t.Parallel()
 
